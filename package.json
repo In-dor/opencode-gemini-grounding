@@ -1,0 +1,20 @@
+{
+  "name": "opencode-google-grounding",
+  "version": "1.0.0",
+  "description": "OpenCode V2 plugin providing Gemini Google Search Grounding with inline citations",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-v2",
+    "plugin",
+    "gemini",
+    "grounding",
+    "websearch",
+    "citations"
+  ],
+  "license": "MIT"
+}
