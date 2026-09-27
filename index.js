@@ -734,19 +734,19 @@ export default {
               }
             );
 
-            if (result.sources && result.sources.length > 0) {
-              return result.sources.map((s) => ({
-                url: s.uri || "",
-                title: s.title || "Source",
-                content: result.content,
-                time: {},
-              }));
-            }
+            // Google Gemini Grounding produces a unified, coherent synthesis with inline citations
+            // and a complete Sources list. We return ONE consolidated result to prevent duplicating
+            // the full text across every source, which would bloat the prompt context by tens of
+            // thousands of tokens and duplicate cards in the UI.
+            const primaryUri = result.sources?.[0]?.uri || "https://google.com";
+            const primaryTitle = result.sources?.[0]?.title
+              ? `Google Gemini Grounding (${result.sources[0].title})`
+              : "Google Gemini Grounding Summary";
 
             return [
               {
-                url: "",
-                title: "Google Grounding Result",
+                url: primaryUri,
+                title: primaryTitle,
                 content: result.content,
                 time: {},
               },
