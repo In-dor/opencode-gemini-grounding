@@ -1,6 +1,6 @@
 <div align="center">
 
-# opencode-google-grounding-v2
+# opencode-gemini-grounding
 
 <p>
   <strong>High-performance LLM Search Grounding Plugin built natively for OpenCode V2</strong><br />
@@ -24,7 +24,7 @@
 
 ## 🌟 Overview
 
-`opencode-google-grounding-v2` is a high-performance web search extension developed strictly following the OpenCode V2 plugin specification. Regardless of your active primary model (Claude, DeepSeek, GPT, or local models), this plugin equips it with real-time web search, fact verification, and source attribution capabilities.
+`opencode-gemini-grounding` is a high-performance web search extension developed strictly following the OpenCode V2 plugin specification. Regardless of your active primary model (Claude, DeepSeek, GPT, or local models), this plugin equips it with real-time web search, fact verification, and source attribution capabilities.
 
 Unlike standard web search tools, it returns concise, fact-checked answers accompanied by **academic-style inline citations (`[1]`, `[2]`)** calculated through a **UTF-8 byte offset reverse-slicing algorithm**, complete with verified source URLs and actual search queries.
 
@@ -106,7 +106,7 @@ Configure plugin options directly in `~/.config/opencode/opencode.jsonc`:
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "opencode-google-grounding-v2",
+      "package": "opencode-gemini-grounding",
       "options": {
         "model": "gemini-3.5-flash-lite",      // Primary grounding model
         "apiKey": "{env:GOOGLE_API_KEY}",       // Auto-resolved environment variable
@@ -153,7 +153,7 @@ Configure plugin options directly in `~/.config/opencode/opencode.jsonc`:
 Create `~/.config/opencode/plugins/google-grounding.js` and re-export this repository:
 
 ```javascript
-export { default } from "file:///D:/OpenCode/opencode-google-grounding-v2/index.js";
+export { default } from "file:///D:/OpenCode/opencode-gemini-grounding/index.js";
 ```
 
 ### Method 2: Directory Junction / Symlink
@@ -162,7 +162,7 @@ Link this repository folder directly into OpenCode's plugin directory:
 
 ```powershell
 # Windows (PowerShell / Command Prompt)
-cmd /c mklink /J "$env:USERPROFILE\.config\opencode\plugins\opencode-google-grounding-v2" "D:\OpenCode\opencode-google-grounding-v2"
+cmd /c mklink /J "$env:USERPROFILE\.config\opencode\plugins\opencode-gemini-grounding" "D:\OpenCode\opencode-gemini-grounding"
 ```
 
 Verify that the plugin is recognized:

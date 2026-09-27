@@ -1,6 +1,6 @@
 <div align="center">
 
-# opencode-google-grounding-v2
+# opencode-gemini-grounding
 
 <p>
   <strong>专为 OpenCode V2 打造的高性能 LLM 搜索接地（Grounding）插件</strong><br />
@@ -24,7 +24,7 @@
 
 ## 🌟 概述
 
-`opencode-google-grounding-v2` 是遵循 OpenCode V2 官方最新规范开发的联网搜索扩展插件。无论当前会话的主力模型是 Claude、DeepSeek、GPT 还是本地模型，均可通过本插件一键赋予其实时联网检索、核实最新事实以及追溯原始网页来源的能力。
+`opencode-gemini-grounding` 是遵循 OpenCode V2 官方最新规范开发的联网搜索扩展插件。无论当前会话的主力模型是 Claude、DeepSeek、GPT 还是本地模型，均可通过本插件一键赋予其实时联网检索、核实最新事实以及追溯原始网页来源的能力。
 
 不同于传统的单网页爬虫，本插件基于 Google Gemini 原生 Search Grounding，返回高度浓缩的事实总结，并利用 **UTF-8 字符字节偏移量逆向切片算法** 将 **`[1]`、`[2]` 行内引用角标** 精准附着在对应事实的句尾，文末附带真实的网页来源和关键词检索记录。
 
@@ -106,7 +106,7 @@
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "opencode-google-grounding-v2",
+      "package": "opencode-gemini-grounding",
       "options": {
         "model": "gemini-3.5-flash-lite",      // 默认首选检索模型
         "apiKey": "{env:GOOGLE_API_KEY}",       // 自动解析环境变量
@@ -153,7 +153,7 @@
 在 OpenCode 全局插件目录新建 `~/.config/opencode/plugins/google-grounding.js`，指向本仓库入口：
 
 ```javascript
-export { default } from "file:///D:/OpenCode/opencode-google-grounding-v2/index.js";
+export { default } from "file:///D:/OpenCode/opencode-gemini-grounding/index.js";
 ```
 
 ### 方式二：目录软链接（Junction）
@@ -162,7 +162,7 @@ export { default } from "file:///D:/OpenCode/opencode-google-grounding-v2/index.
 
 ```powershell
 # Windows 环境（PowerShell）
-cmd /c mklink /J "$env:USERPROFILE\.config\opencode\plugins\opencode-google-grounding-v2" "D:\OpenCode\opencode-google-grounding-v2"
+cmd /c mklink /J "$env:USERPROFILE\.config\opencode\plugins\opencode-gemini-grounding" "D:\OpenCode\opencode-gemini-grounding"
 ```
 
 验证插件是否已被 OpenCode 识别：
