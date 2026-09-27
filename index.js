@@ -5,6 +5,15 @@ import os from "node:os";
 const DEFAULT_MODEL = "gemini-3.8-flash";
 const DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 
+// Default fallback chain when the primary model fails or encounters rate limits
+const DEFAULT_FALLBACK_MODELS = [
+  "gemini-3.8-flash",
+  "gemini-3.7-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3-flash-preview",
+  "gemini-2.5-flash",
+];
+
 /**
  * Strips JSONC comments while respecting string literals.
  */
@@ -98,9 +107,17 @@ function resolveConfig() {
     indorProvider?.options?.apiKey ||
     "";
 
+  // Dynamic model lookup priority:
+  // 1. env OPENCODE_GOOGLE_MODEL
+  // 2. providers.google.model / settings.model
+  // 3. providers.google.options.websearch_cited.model / options.model
+  // 4. DEFAULT_MODEL (gemini-3.8-flash)
   const model =
     process.env.OPENCODE_GOOGLE_MODEL ||
+    googleProvider?.model ||
+    googleProvider?.settings?.model ||
     googleProvider?.options?.websearch_cited?.model ||
+    googleProvider?.options?.model ||
     DEFAULT_MODEL;
 
   return {
@@ -208,7 +225,8 @@ function formatOutput(rawText, metadata, maxSources = 8) {
 }
 
 /**
- * Dispatches the generateContent call with googleSearch grounding enabled.
+ * Dispatches the generateContent call with googleSearch grounding enabled,
+ * supporting dynamic model selection and automatic fallback chain.
  */
 async function runGoogleGrounding(args, signal) {
   const query = args.query?.trim();
@@ -230,7 +248,13 @@ async function runGoogleGrounding(args, signal) {
     "\nUse Google Search grounding to provide accurate, up-to-date information with source attribution.",
   ].join("");
 
-  const url = `${config.baseURL}/models/${config.model}:generateContent?key=${encodeURIComponent(config.apiKey)}`;
+  // Build candidate model list with requested model first (if any), followed by fallback chain
+  const requestedModel = args.model?.trim();
+  const rawCandidates = requestedModel
+    ? [requestedModel, config.model, ...DEFAULT_FALLBACK_MODELS]
+    : [config.model, ...DEFAULT_FALLBACK_MODELS];
+
+  const uniqueCandidates = Array.from(new Set(rawCandidates.filter(Boolean)));
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("Google grounding request timed out")), config.timeoutMs);
@@ -238,50 +262,70 @@ async function runGoogleGrounding(args, signal) {
     signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
   }
 
+  let lastError = null;
+
   try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": config.apiKey,
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }],
+    for (const currentModel of uniqueCandidates) {
+      const url = `${config.baseURL}/models/${currentModel}:generateContent?key=${encodeURIComponent(config.apiKey)}`;
+
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": config.apiKey,
           },
-        ],
-        tools: [{ googleSearch: {} }],
-      }),
-      signal: controller.signal,
-    });
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: prompt }],
+              },
+            ],
+            tools: [{ googleSearch: {} }],
+          }),
+          signal: controller.signal,
+        });
 
-    const text = await response.text();
-    let body;
-    try {
-      body = JSON.parse(text);
-    } catch {
-      throw new Error(`Failed to parse response from Google grounding (${response.status}): ${text}`);
-    }
+        const text = await response.text();
+        let body;
+        try {
+          body = JSON.parse(text);
+        } catch {
+          throw new Error(`Failed to parse response from ${currentModel} (${response.status}): ${text}`);
+        }
 
-    if (!response.ok || body?.error) {
-      const msg = body?.error?.message || text;
-      throw new Error(`Google grounding request failed (${response.status}): ${msg}`);
-    }
+        if (!response.ok || body?.error) {
+          const msg = body?.error?.message || text;
+          throw new Error(`Google grounding request to ${currentModel} failed (${response.status}): ${msg}`);
+        }
 
-    const candidate = body.candidates?.[0];
-    const candidateParts = candidate?.content?.parts || [];
-    let responseText = "";
-    for (const part of candidateParts) {
-      if (part.thought) continue;
-      if (typeof part.text === "string") {
-        responseText += part.text;
+        const candidate = body.candidates?.[0];
+        const candidateParts = candidate?.content?.parts || [];
+        let responseText = "";
+        for (const part of candidateParts) {
+          if (part.thought) continue;
+          if (typeof part.text === "string") {
+            responseText += part.text;
+          }
+        }
+
+        const formatted = formatOutput(responseText, candidate?.groundingMetadata, maxSources);
+        return {
+          content: formatted,
+          model: currentModel,
+        };
+      } catch (err) {
+        lastError = err;
+        // If aborted, stop immediately
+        if (controller.signal.aborted) {
+          throw err;
+        }
+        // Otherwise, continue to the next candidate model in the chain
       }
     }
 
-    const formatted = formatOutput(responseText, candidate?.groundingMetadata, maxSources);
-    return formatted;
+    throw lastError || new Error("All candidate models failed for Google grounding.");
   } finally {
     clearTimeout(timer);
   }
@@ -305,6 +349,11 @@ export default {
               type: "string",
               description: "Optional extra context, constraints, or known facts to guide the search.",
             },
+            model: {
+              type: "string",
+              description:
+                "Optional Gemini model ID for grounding (e.g. 'gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.7-flash', 'gemini-3.1-pro-preview'). Defaults to configured model with automatic fallback.",
+            },
             max_sources: {
               type: "number",
               description: "Maximum number of grounded sources to return (1-20). Defaults to 8.",
@@ -314,8 +363,13 @@ export default {
           additionalProperties: false,
         },
         async execute(input, context) {
-          const content = await runGoogleGrounding(input, context?.signal);
-          return { content };
+          const result = await runGoogleGrounding(input, context?.signal);
+          return {
+            content: result.content,
+            metadata: {
+              model: result.model,
+            },
+          };
         },
       };
 
