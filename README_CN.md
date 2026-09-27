@@ -32,10 +32,13 @@
 
 ## ✨ 核心特性
 
-- **🚀 原生适配 OpenCode V2**：严格采用 V2 的 `id` + `setup(ctx)` + `ctx.tool.transform` 扩展架构，纯 ESM 代码，零构建步骤。
-- **🛡️ 纯外挂零系统侵入**：作为独立的自定义工具运行，不修改 Provider 认证拦截器，绝不引发登录或鉴权冲突。
-- **🔄 双工具名无缝兼容**：同时注册 `google_grounding` 与 `websearch_cited` 两个工具名，满足任意系统提示词或模型的调用习惯。
-- **🧠 动态模型即时切换**：支持在单次搜索时动态指定任意 Gemini 模型（如轻量高频使用 `gemini-3.5-flash-lite`，深度研究使用 `gemini-3.1-pro-preview` 等）。
+- **🚀 原生适配 OpenCode V2 核心体系**：基于 V2 `id` + `setup(ctx)` 生命周期开发，同时深度对接 `ctx.tool`、`ctx.websearch`、`ctx.storage` 与 `context.progress`。
+- **🌐 Tool + Websearch 双体系注册**：
+  - **自定义工具**：暴露 `google_grounding` 与 `websearch_cited` 两个别名工具，并入驻 Code Mode 的 `search` 命名空间（`tools.search.google_grounding`）。
+  - **全局系统搜索引擎**：自动将 Google Gemini Grounding 注册并设为 OpenCode V2 全局默认的 `websearch` 提供商，任何使用内置网络搜索的 Agent 均能享受精准接地。
+- **⚡ 原生持久化缓存（`ctx.storage`）**：依托 OpenCode Server 原生沙盒存储实现 TTL 缓存（默认 10 分钟），重复提问秒级瞬返，零额外延迟、零 Token 开销、彻底免疫 429。
+- **🔔 实时进度与状态反馈（`context.progress`）**：在 TUI 终端与 Web 界面中动态显示“正在检索 Google...”、“已命中本地缓存”、“正在顺延降级至下一模型...”等友好进度条。
+- **⚙️ 标准化 `ctx.options` 支持**：支持在 `opencode.jsonc` 中直接为插件传入结构化 options 配置，配合 `{env:VAR}` 插值，免除硬编码与手动文件解析。
 - **⚡ 故障自动容灾降级链**：内置多模型备选梯队，单模型请求超时宽松设定为 45 秒，总超时 180 秒（3 分钟）。遇到限流（HTTP 429）或网关波动时自动无感顺延；遇到鉴权无效（HTTP 401/403）等致命错误立即终止，绝不盲目轮询浪费时间。
 - **🧠 动态模型即时切换与归一化**：支持在单次搜索时动态指定任意 Gemini 模型，自动兼容 `google/` 等前缀写法并完成格式归一化。
 - **📍 学术级精准角标排版与防断链**：解析底层的 `groundingSupports`，动态维护角标重映射（Remap），确保正文 `[1]`、`[2]` 与文末 Sources 严格一一对应；文末采用美观的 Markdown 超链接，告别超长重定向链接刷屏。
@@ -59,14 +62,36 @@
 
 ## ⚙️ 配置与优先级规则
 
-插件在初始化和执行时，按以下优先级逐层解析连接参数：
+### 1. 现代化插件选项配置（推荐，`opencode.jsonc`）
 
-### 1. 模型选择（Model）
+你可以直接在 `~/.config/opencode/opencode.jsonc` 中配置插件专属选项：
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "opencode-google-grounding-v2",
+      "options": {
+        "model": "gemini-3.5-flash-lite",      // 默认首选检索模型
+        "apiKey": "{env:GOOGLE_API_KEY}",       // 自动解析环境变量
+        "cacheTtlMs": 600000,                  // 本地持久化缓存时间（毫秒，默认10分钟，0为禁用）
+        "requestTimeoutMs": 45000,              // 单个模型请求超时时间（45秒）
+        "timeoutMs": 180000,                    // 容灾降级总超时（3分钟）
+        "setDefaultWebsearch": true             // 自动设为 OpenCode 全局默认 WebSearch 源
+      }
+    }
+  ]
+}
+```
+
+### 2. 模型选择优先级（Model）
 1. 本次工具调用动态传入的 `model` 参数；
-2. 环境变量 `OPENCODE_GOOGLE_MODEL`；
-3. `opencode.jsonc` 中的 `providers.google.model` 或 `settings.model`；
-4. `opencode.jsonc` 中的 `providers.google.options.websearch_cited.model`；
-5. 默认回退值：`gemini-3.5-flash-lite`。
+2. `opencode.jsonc` 插件选项 `options.model`；
+3. 环境变量 `OPENCODE_GOOGLE_MODEL`；
+4. `opencode.jsonc` 中的 `providers.google.model` 或 `settings.model`；
+5. `opencode.jsonc` 中的 `providers.google.options.websearch_cited.model`；
+6. 默认回退值：`gemini-3.5-flash-lite`。
 
 > **容灾降级链机制**：
 > 若首选模型请求失败或触发频率限制，插件将按如下顺序自动降级重试：

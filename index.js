@@ -5,9 +5,10 @@ import os from "node:os";
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 
-// Per-model request timeout (45s) and overall fallback chain timeout (180s / 3 minutes)
+// Per-model request timeout (45s), overall fallback chain timeout (180s / 3 minutes), and cache TTL (10m)
 const DEFAULT_REQUEST_TIMEOUT_MS = 45000;
 const DEFAULT_TOTAL_TIMEOUT_MS = 180000;
+const DEFAULT_CACHE_TTL_MS = 600000;
 
 // Default fallback chain when the primary model fails or encounters rate limits
 const DEFAULT_FALLBACK_MODELS = [
@@ -40,6 +41,52 @@ function normalizeModelId(modelId) {
     clean = clean.split("/").pop() || clean;
   }
   return clean;
+}
+
+/**
+ * Resolves potential '{env:VAR_NAME}' placeholders.
+ */
+function resolveEnvPlaceholder(val) {
+  if (typeof val !== "string") return val;
+  const match = val.match(/^\{env:([A-Za-z0-9_]+)\}$/);
+  if (match) {
+    return process.env[match[1]] || "";
+  }
+  return val;
+}
+
+/**
+ * Fast string hashing for cache keys.
+ */
+function hashString(str) {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = (hash * 33) ^ str.charCodeAt(i);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+/**
+ * Computes a unique cache key based on query and context.
+ */
+function makeCacheKey(query, context) {
+  const normQuery = (query || "").trim().toLowerCase();
+  const normContext = (context || "").trim().toLowerCase();
+  const hash = hashString(`${normQuery}::${normContext}`);
+  return `cache:v1:grounding:${hash}`;
+}
+
+/**
+ * Reports progress safely to context.progress without throwing.
+ */
+async function reportProgress(progressFn, status) {
+  if (typeof progressFn === "function") {
+    try {
+      await progressFn({ status });
+    } catch {
+      // Progress reporting errors should never disrupt core operations
+    }
+  }
 }
 
 /**
@@ -103,9 +150,10 @@ function readJsonFile(filePath) {
 }
 
 /**
- * Resolves connection settings from env vars, opencode.jsonc, and auth.json.
+ * Resolves connection settings with full support for OpenCode V2 ctx.options,
+ * environment variables, opencode.jsonc, and auth.json.
  */
-function resolveConfig() {
+function resolveConfig(pluginOptions = {}) {
   const homeDir = os.homedir();
   const configPath = path.join(homeDir, ".config", "opencode", "opencode.jsonc");
   const configPathJson = path.join(homeDir, ".config", "opencode", "opencode.json");
@@ -118,12 +166,14 @@ function resolveConfig() {
   const indorProvider = config?.providers?.indor || config?.provider?.indor || {};
 
   const baseURL =
+    pluginOptions.baseURL ||
     process.env.OPENCODE_GOOGLE_BASE_URL ||
     googleProvider?.settings?.baseURL ||
     googleProvider?.options?.baseURL ||
     DEFAULT_GEMINI_BASE_URL;
 
-  const apiKey =
+  const rawApiKey =
+    pluginOptions.apiKey ||
     process.env.OPENCODE_GOOGLE_API_KEY ||
     process.env.GOOGLE_API_KEY ||
     process.env.GEMINI_API_KEY ||
@@ -135,12 +185,10 @@ function resolveConfig() {
     indorProvider?.options?.apiKey ||
     "";
 
-  // Dynamic model lookup priority:
-  // 1. env OPENCODE_GOOGLE_MODEL
-  // 2. providers.google.model / settings.model
-  // 3. providers.google.options.websearch_cited.model / options.model
-  // 4. DEFAULT_MODEL (gemini-3.5-flash-lite)
+  const apiKey = resolveEnvPlaceholder(rawApiKey);
+
   const model =
+    pluginOptions.model ||
     process.env.OPENCODE_GOOGLE_MODEL ||
     googleProvider?.model ||
     googleProvider?.settings?.model ||
@@ -148,15 +196,36 @@ function resolveConfig() {
     googleProvider?.options?.model ||
     DEFAULT_MODEL;
 
-  const timeoutMs = Number(process.env.OPENCODE_GOOGLE_TIMEOUT_MS) || DEFAULT_TOTAL_TIMEOUT_MS;
-  const requestTimeoutMs = Number(process.env.OPENCODE_GOOGLE_REQUEST_TIMEOUT_MS) || DEFAULT_REQUEST_TIMEOUT_MS;
+  const fallbackModels =
+    Array.isArray(pluginOptions.fallbackModels) && pluginOptions.fallbackModels.length > 0
+      ? pluginOptions.fallbackModels
+      : DEFAULT_FALLBACK_MODELS;
+
+  const timeoutMs =
+    Number(pluginOptions.timeoutMs) ||
+    Number(process.env.OPENCODE_GOOGLE_TIMEOUT_MS) ||
+    DEFAULT_TOTAL_TIMEOUT_MS;
+
+  const requestTimeoutMs =
+    Number(pluginOptions.requestTimeoutMs) ||
+    Number(process.env.OPENCODE_GOOGLE_REQUEST_TIMEOUT_MS) ||
+    DEFAULT_REQUEST_TIMEOUT_MS;
+
+  const cacheTtlMs =
+    pluginOptions.cacheTtlMs !== undefined
+      ? Number(pluginOptions.cacheTtlMs)
+      : process.env.OPENCODE_GOOGLE_CACHE_TTL_MS !== undefined
+      ? Number(process.env.OPENCODE_GOOGLE_CACHE_TTL_MS)
+      : DEFAULT_CACHE_TTL_MS;
 
   return {
     baseURL: baseURL.replace(/\/+$/, ""),
-    apiKey: apiKey.trim(),
+    apiKey: (apiKey || "").trim(),
     model: normalizeModelId(model),
+    fallbackModels,
     timeoutMs,
     requestTimeoutMs,
+    cacheTtlMs,
   };
 }
 
@@ -251,8 +320,7 @@ function insertMarkersByUtf8Index(text, insertions) {
 
 /**
  * Formats grounding output with citations, sources list, and search queries.
- * Ensures consistent 1-to-1 indexing between inline markers and Sources list,
- * using Markdown hyperlinks to prevent long redirect URLs from cluttering.
+ * Returns both structured sources and a formatted markdown text with hyperlinks.
  */
 function formatOutput(rawText, metadata, maxSources = 8) {
   let text = rawText || "";
@@ -301,6 +369,7 @@ function formatOutput(rawText, metadata, maxSources = 8) {
   }
 
   const parts = [text.trim() || "No search results or information found."];
+  const structuredSources = [];
 
   if (selectedChunkIndices.length > 0) {
     const sourceLines = selectedChunkIndices.map((chunkIdx) => {
@@ -311,6 +380,11 @@ function formatOutput(rawText, metadata, maxSources = 8) {
       const fallbackTitle = extractDomain(uri) || "Source";
       const title = rawTitle || fallbackTitle;
       const safeTitle = escapeMarkdown(title);
+      structuredSources.push({
+        index: displayIdx,
+        title,
+        uri,
+      });
       return uri ? `[${displayIdx}] [${safeTitle}](${uri})` : `[${displayIdx}] ${safeTitle}`;
     });
     parts.push(`Sources:\n${sourceLines.join("\n")}`);
@@ -321,28 +395,76 @@ function formatOutput(rawText, metadata, maxSources = 8) {
     parts.push(`Search queries: ${queries.join("; ")}`);
   }
 
-  return parts.join("\n\n");
+  const content = parts.join("\n\n");
+  return {
+    content,
+    sources: structuredSources,
+    queries,
+    toString() {
+      return this.content;
+    },
+  };
 }
 
 /**
  * Dispatches the generateContent call with googleSearch grounding enabled,
- * supporting dynamic model selection, per-request timeouts, and an automatic fallback chain.
+ * supporting dynamic model selection, per-request timeouts, automatic fallback,
+ * context.progress reporting, and durable ctx.storage caching.
  */
-async function runGoogleGrounding(args, signal) {
+async function runGoogleGrounding(args, runContext = {}) {
   const query = args.query?.trim();
   if (!query) {
     throw new Error("The 'query' parameter is required.");
   }
 
-  const config = resolveConfig();
+  // Discriminate runContext: supports either AbortSignal or context object
+  let signal;
+  let progress;
+  let storage;
+  let pluginOptions = {};
+
+  if (runContext && typeof runContext.addEventListener === "function") {
+    signal = runContext;
+  } else if (runContext && typeof runContext === "object") {
+    signal = runContext.signal;
+    progress = runContext.progress;
+    storage = runContext.storage;
+    pluginOptions = runContext.options || {};
+  }
+
+  const config = resolveConfig(pluginOptions);
   if (!config.apiKey) {
     throw new FatalError(
-      "Missing API key for Google grounding. Please configure it in opencode auth or set GOOGLE_API_KEY environment variable.",
+      "Missing API key for Google grounding. Please configure it in opencode auth, opencode.jsonc plugin options, or set GOOGLE_API_KEY environment variable.",
       401
     );
   }
 
   const maxSources = Math.max(1, Math.min(Number(args.max_sources ?? 8), 20));
+
+  // --- Scheme 3: Cache lookup via ctx.storage ---
+  const cacheEnabled = config.cacheTtlMs > 0 && Boolean(storage && typeof storage.get === "function");
+  const cacheKey = cacheEnabled ? makeCacheKey(query, args.context) : null;
+
+  if (cacheEnabled && cacheKey) {
+    try {
+      const cached = await storage.get(cacheKey);
+      if (cached && typeof cached === "object" && cached.timestamp) {
+        if (Date.now() - cached.timestamp < config.cacheTtlMs) {
+          await reportProgress(progress, "Found cached Google search results");
+          return {
+            content: cached.content,
+            sources: cached.sources || [],
+            model: cached.model || config.model,
+            cached: true,
+          };
+        }
+      }
+    } catch {
+      // Storage read errors should not abort search
+    }
+  }
+
   const prompt = [
     query,
     args.context ? `\nAdditional context:\n${args.context}` : "",
@@ -352,8 +474,8 @@ async function runGoogleGrounding(args, signal) {
   // Build candidate model list with requested model first (if any), normalized and deduplicated
   const requestedModel = normalizeModelId(args.model);
   const rawCandidates = requestedModel
-    ? [requestedModel, config.model, ...DEFAULT_FALLBACK_MODELS]
-    : [config.model, ...DEFAULT_FALLBACK_MODELS];
+    ? [requestedModel, config.model, ...config.fallbackModels]
+    : [config.model, ...config.fallbackModels];
 
   const uniqueCandidates = Array.from(new Set(rawCandidates.map(normalizeModelId).filter(Boolean)));
 
@@ -372,10 +494,14 @@ async function runGoogleGrounding(args, signal) {
   let lastError = null;
 
   try {
-    for (const currentModel of uniqueCandidates) {
+    for (let i = 0; i < uniqueCandidates.length; i++) {
+      const currentModel = uniqueCandidates[i];
+
       if (totalController.signal.aborted) {
         throw totalController.signal.reason || new Error("Google grounding request was cancelled or timed out.");
       }
+
+      await reportProgress(progress, `Searching Google with ${currentModel}...`);
 
       const requestController = new AbortController();
       const requestTimer = setTimeout(() => {
@@ -451,11 +577,31 @@ async function runGoogleGrounding(args, signal) {
           responseText = `[Search output blocked or truncated by provider: finishReason=${finishReason}]`;
         }
 
+        await reportProgress(progress, "Rendering citations and sources...");
+
         const formatted = formatOutput(responseText, candidate?.groundingMetadata, maxSources);
-        return {
-          content: formatted,
+        const result = {
+          content: formatted.content,
+          sources: formatted.sources,
           model: currentModel,
+          cached: false,
         };
+
+        // Cache result in ctx.storage if available
+        if (cacheEnabled && cacheKey && storage && typeof storage.set === "function") {
+          try {
+            await storage.set(cacheKey, {
+              content: result.content,
+              sources: result.sources,
+              model: result.model,
+              timestamp: Date.now(),
+            });
+          } catch {
+            // Storage write errors should not break search
+          }
+        }
+
+        return result;
       } catch (err) {
         lastError = err;
 
@@ -467,7 +613,14 @@ async function runGoogleGrounding(args, signal) {
           throw totalController.signal.reason || err;
         }
 
-        // For retryable errors (429, 404, 5xx) or per-model timeouts, continue to next candidate
+        // For retryable errors (429, 404, 5xx) or per-model timeouts, inform progress and continue
+        const nextModel = uniqueCandidates[i + 1];
+        if (nextModel) {
+          await reportProgress(
+            progress,
+            `Model ${currentModel} encountered error, falling back to ${nextModel}...`
+          );
+        }
       } finally {
         clearTimeout(requestTimer);
         totalController.signal.removeEventListener("abort", onTotalAbortForRequest);
@@ -486,55 +639,126 @@ async function runGoogleGrounding(args, signal) {
 export default {
   id: "google-grounding",
   setup: async (ctx) => {
-    await ctx.tool.transform((tools) => {
-      const toolDef = {
-        description:
-          "Search the web with Gemini Google Search grounding. Returns an up-to-date, source-backed answer with inline citations [1], [2] and a Sources list of URLs.",
-        input: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "The question or search query to answer with Google Search grounding.",
+    const pluginOptions = ctx?.options || {};
+
+    // 1. Tool domain registration (for direct tool invocations)
+    if (ctx?.tool) {
+      await ctx.tool.transform((tools) => {
+        // Register Code Mode namespace if supported
+        if (typeof tools.namespace === "function") {
+          try {
+            tools.namespace({
+              name: "search",
+              description: "Google Search grounding tools with academic-style inline citations",
+            });
+          } catch {
+            // Optional namespace registration
+          }
+        }
+
+        const toolDef = {
+          description:
+            "Search the web with Gemini Google Search grounding. Returns an up-to-date, source-backed answer with inline citations [1], [2] and a Sources list of URLs.",
+          input: {
+            type: "object",
+            properties: {
+              query: {
+                type: "string",
+                description: "The question or search query to answer with Google Search grounding.",
+              },
+              context: {
+                type: "string",
+                description: "Optional extra context, constraints, or known facts to guide the search.",
+              },
+              model: {
+                type: "string",
+                description:
+                  "Optional Gemini model ID for grounding (e.g. 'gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.1-flash-lite'). Defaults to configured model with automatic fallback.",
+              },
+              max_sources: {
+                type: "number",
+                description: "Maximum number of grounded sources to return (1-20). Defaults to 8.",
+              },
             },
-            context: {
-              type: "string",
-              description: "Optional extra context, constraints, or known facts to guide the search.",
-            },
-            model: {
-              type: "string",
-              description:
-                "Optional Gemini model ID for grounding (e.g. 'gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.1-flash-lite'). Defaults to configured model with automatic fallback.",
-            },
-            max_sources: {
-              type: "number",
-              description: "Maximum number of grounded sources to return (1-20). Defaults to 8.",
-            },
+            required: ["query"],
+            additionalProperties: false,
           },
-          required: ["query"],
-          additionalProperties: false,
-        },
-        async execute(input, context) {
-          const result = await runGoogleGrounding(input, context?.signal);
-          return {
-            content: result.content,
-            metadata: {
-              model: result.model,
-            },
-          };
-        },
-      };
+          options: {
+            namespace: "search",
+            codemode: true,
+          },
+          async execute(input, context) {
+            const result = await runGoogleGrounding(input, {
+              signal: context?.signal,
+              progress: context?.progress?.bind(context),
+              storage: ctx?.storage,
+              options: pluginOptions,
+            });
+            return {
+              content: result.content,
+              metadata: {
+                model: result.model,
+                cached: Boolean(result.cached),
+              },
+            };
+          },
+        };
 
-      tools.add({
-        name: "google_grounding",
-        ...toolDef,
-      });
+        tools.add({
+          name: "google_grounding",
+          ...toolDef,
+        });
 
-      // Also register websearch_cited as an alias so prompts expecting either name work
-      tools.add({
-        name: "websearch_cited",
-        ...toolDef,
+        // Also register websearch_cited as an alias so prompts expecting either name work
+        tools.add({
+          name: "websearch_cited",
+          ...toolDef,
+        });
       });
-    });
+    }
+
+    // 2. Websearch domain registration (for OpenCode V2 native web search integration)
+    if (ctx?.websearch) {
+      await ctx.websearch.transform((editor) => {
+        editor.add({
+          id: "google-grounding",
+          name: "Google Gemini Grounding",
+          execute: async ({ query }, context) => {
+            const result = await runGoogleGrounding(
+              { query },
+              {
+                signal: context?.signal,
+                progress: context?.progress?.bind(context),
+                storage: ctx?.storage,
+                options: pluginOptions,
+              }
+            );
+
+            if (result.sources && result.sources.length > 0) {
+              return result.sources.map((s) => ({
+                url: s.uri || "",
+                title: s.title || "Source",
+                content: result.content,
+                time: {},
+              }));
+            }
+
+            return [
+              {
+                url: "",
+                title: "Google Grounding Result",
+                content: result.content,
+                time: {},
+              },
+            ];
+          },
+        });
+
+        // Automatically set as default OpenCode V2 websearch provider unless explicitly disabled
+        if (pluginOptions.setDefaultWebsearch !== false && editor.default?.set) {
+          editor.default.set("google-grounding");
+        }
+      });
+    }
   },
 };
