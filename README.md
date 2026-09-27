@@ -1,70 +1,135 @@
-# opencode-google-grounding (OpenCode V2)
+<div align="center">
 
-适用于 [OpenCode V2](https://opencode.ai) 的联网搜索插件，基于 Gemini Google Search Grounding（搜索接地）能力，提供学术论文级的行内引用（`[1]`、`[2]`）与文末来源网页链接。
+# opencode-google-grounding-v2
 
-## 特性
+<p>
+  <strong>High-performance, LLM-grounded web search plugin for OpenCode V2</strong><br />
+  Powered by Google Gemini Search Grounding with academic-style inline citations and fault-tolerant fallback.
+</p>
 
-- **原生支持 OpenCode V2**：严格遵循 V2 插件规范（`id` + `setup(ctx)` + `ctx.tool.transform`）。
-- **零系统侵入**：纯外挂独立工具架构，不篡改 Provider 认证生命周期，不干扰主流程。
-- **双工具名兼容**：同时注册 `google_grounding` 与 `websearch_cited` 两个名称，Prompt 无论提到哪个均可直接调用。
-- **动态模型选择与故障自动降级**：
-  - 支持在工具调用时动态传入 `model`（如 `gemini-3.5-flash-lite`、`gemini-3.8-flash`、`gemini-3.1-pro-preview`）；
-  - 支持通过配置文件或环境变量随时变更默认模型；
-  - 内置自动容灾降级链：首选模型遇限流（429）或故障时，自动按优先级顺延尝试候选模型，杜绝搜索中断。
-- **精准行内引用标注**：利用 `groundingSupports` 的 UTF-8 字节偏移量算法，在正文具体事实句末精准插入 `[1]`、`[2]` 角标。
-- **来源与检索词展示**：文末自动输出带标题与真实网页 URL 的 `Sources:` 列表及 `Search queries:`。
-- **自定义网关友好**：自动复用 `~/.config/opencode/opencode.jsonc` 中配置的本地 Gemini 网关（如 `http://192.168.31.198:7870/v1beta`）及已保存的密钥，同时也支持官方 API 与环境变量兜底。
+<p>
+  <a href="https://opencode.ai"><img src="https://img.shields.io/badge/OpenCode-V2%20Compatible-4F46E5?style=flat-square" alt="OpenCode V2" /></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License" /></a>
+  <img src="https://img.shields.io/badge/ESM-Native-blue.svg?style=flat-square" alt="ESM" />
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform" />
+</p>
 
-## 注册工具名
+<p>
+  <a href="README.md"><strong>English</strong></a> · <a href="README_CN.md"><strong>简体中文</strong></a>
+</p>
 
-- `google_grounding`
-- `websearch_cited`
+---
 
-## 工具入参说明
+</div>
 
-| 参数名 | 类型 | 必填 | 说明 |
-| :--- | :--- | :--- | :--- |
-| `query` | `string` | 是 | 搜索问题或检索词 |
-| `model` | `string` | 否 | 动态指定当前搜索要用的 Gemini 模型（如 `gemini-3.5-flash-lite`）。未指定时按配置优先级取默认值 |
-| `context` | `string` | 否 | 附加的约束条件或背景上下文 |
-| `max_sources` | `number` | 否 | 单次最大返回来源网页数（1~20），默认 `8` |
+## 🌟 Overview
 
-## 配置与参数优先级
+`opencode-google-grounding-v2` is an official-specification OpenCode V2 plugin that equips your AI agents (Claude, DeepSeek, GPT, etc.) with real-time Google Web Search capabilities through Gemini Search Grounding.
 
-插件解析请求参数的顺序如下：
+Unlike standard web search tools, it returns concise, fact-checked answers accompanied by **exact inline citation markers (`[1]`, `[2]`)** injected at precise UTF-8 byte offsets, followed by verified source URLs and executed search queries.
 
-1. **模型（Model）选择优先级**：
-   - 工具入参实时指定的 `model`
-   - 环境变量 `OPENCODE_GOOGLE_MODEL`
-   - `opencode.jsonc` 中的 `providers.google.model` 或 `settings.model`
-   - `opencode.jsonc` 中的 `providers.google.options.websearch_cited.model`
-   - 默认值：`gemini-3.8-flash`
-   - *（注：如果上述指定的模型遇到 429 限流或请求失败，插件会自动按 `3.8-flash -> 3.7-flash -> 3.5-flash-lite -> 3-flash-preview -> 2.5-flash` 顺序自动平滑降级重试）*
+---
 
-2. **接口基础地址（Base URL）**：
-   - 环境变量 `OPENCODE_GOOGLE_BASE_URL`
-   - `~/.config/opencode/opencode.jsonc` 中的 `providers.google.settings.baseURL`
-   - 默认值：`https://generativelanguage.googleapis.com/v1beta`
+## ✨ Features
 
-3. **API 密钥（API Key）**：
-   - 环境变量 `OPENCODE_GOOGLE_API_KEY` / `GOOGLE_API_KEY` / `GEMINI_API_KEY`
-   - `~/.local/share/opencode/auth.json` 中保存的凭据（`google.key` 或 `indor.key`）
-   - `opencode.jsonc` 中的 `providers.google.settings.apiKey`
+- **🚀 Native OpenCode V2 Architecture**: Built strictly on OpenCode V2's `id` + `setup(ctx)` + `ctx.tool.transform` lifecycle. Pure ESM without compilation needed.
+- **🛡️ Zero Intrusiveness**: Operates as a completely independent custom tool without intercepting provider auth or modifying global request pipelines.
+- **🔄 Dual Tool Compatibility**: Exposes both `google_grounding` and `websearch_cited` to satisfy various prompt conventions.
+- **🧠 Dynamic Model Switching**: Supports runtime model selection per search call (`gemini-3.5-flash-lite`, `gemini-3.8-flash`, `gemini-3.1-pro-preview`, etc.).
+- **⚡ Automatic Fallback Chain**: Built-in fault tolerance—if the requested model encounters rate limits (HTTP 429) or gateway errors (502/503), it smoothly falls back through candidate models.
+- **📍 Academic-Style Precision Citations**: Calculates exact UTF-8 byte offsets from Gemini's `groundingSupports` to insert `[1]`, `[2]` right after each fact.
+- **🌐 Reverse Proxy & Custom Gateway Ready**: Seamlessly reads your existing `providers.google.settings.baseURL` (e.g. OneAPI / NewAPI / LAN gateway) and stored auth keys.
 
-## 本地安装与引入方式
+---
 
-在 `~/.config/opencode/plugins/google-grounding.js` 中直接重导出本仓库：
+## 🛠️ Tool Signature
+
+The plugin registers two identical tools: `google_grounding` and `websearch_cited`.
+
+### Parameters
+
+| Argument | Type | Required | Description |
+| :--- | :--- | :---: | :--- |
+| `query` | `string` | **Yes** | The question or natural language search query. |
+| `model` | `string` | No | Optional Gemini model ID (e.g. `gemini-3.5-flash-lite`, `gemini-3.8-flash`, `gemini-3.1-pro-preview`). Defaults to configured model. |
+| `context` | `string` | No | Optional extra background, constraints, or guidelines for the search. |
+| `max_sources` | `number` | No | Maximum number of grounded source links to return (1-20, default: `8`). |
+
+---
+
+## ⚙️ Configuration & Priority
+
+The plugin resolves connection parameters in the following order:
+
+### 1. Model Resolution
+1. Dynamic `model` argument provided in the tool call.
+2. `OPENCODE_GOOGLE_MODEL` environment variable.
+3. `providers.google.model` or `providers.google.settings.model` in `~/.config/opencode/opencode.jsonc`.
+4. `providers.google.options.websearch_cited.model`.
+5. Default fallback: `gemini-3.8-flash`.
+
+> **Automatic Fallback Chain**:
+> If a model fails or hits rate limits, the plugin tries the next candidate automatically:
+> `[Requested Model] -> gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.5-flash-lite -> gemini-3-flash-preview -> gemini-2.5-flash`.
+
+### 2. Base URL (API Gateway)
+1. `OPENCODE_GOOGLE_BASE_URL` environment variable.
+2. `providers.google.settings.baseURL` in `~/.config/opencode/opencode.jsonc`.
+3. Default: `https://generativelanguage.googleapis.com/v1beta` (Official Google API).
+
+### 3. API Key
+1. `OPENCODE_GOOGLE_API_KEY` / `GOOGLE_API_KEY` / `GEMINI_API_KEY` environment variables.
+2. Stored OpenCode credentials in `~/.local/share/opencode/auth.json` (`google.key` or `indor.key`).
+3. `providers.google.settings.apiKey` in `opencode.jsonc`.
+
+---
+
+## 📦 Installation in OpenCode V2
+
+### Method 1: Global Plugin Bridge (Recommended)
+
+Create `~/.config/opencode/plugins/google-grounding.js` and re-export this repository:
 
 ```javascript
-export { default } from "file:///D:/OpenCode/opencode-google-grounding/index.js";
+export { default } from "file:///D:/OpenCode/opencode-google-grounding-v2/index.js";
 ```
 
-查看已加载的插件：
+### Method 2: Directory Junction / Symlink
 
-```sh
+Link this repository folder directly into OpenCode's plugin directory:
+
+```powershell
+# Windows (PowerShell / Command Prompt)
+cmd /c mklink /J "$env:USERPROFILE\.config\opencode\plugins\opencode-google-grounding-v2" "D:\OpenCode\opencode-google-grounding-v2"
+```
+
+Verify that the plugin is recognized:
+
+```bash
 opencode plugin list
 ```
 
-## 许可证
+---
 
-MIT
+## 📝 Example Output
+
+```markdown
+According to the latest meteorological bulletins, Beijing weather for today (September 27) is clear and pleasant after rain[1]:
+
+* **Condition**: Becoming clear and sunny during the day, partly cloudy at night[1][2].
+* **Temperature**: Daytime high around 26°C, dropping to 15°C~16°C overnight[1][3].
+* **Wind**: Northerly winds around Force 3 with gusts reaching Force 5~6 during daytime[1].
+
+Sources:
+[1] bjd.com.cn (https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
+[2] weather.com.cn (https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
+[3] nmc.cn (https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
+
+Search queries: Beijing weather September 27; Beijing meteorological bureau report
+```
+
+---
+
+## 📄 License
+
+Distributed under the [MIT License](./LICENSE).
