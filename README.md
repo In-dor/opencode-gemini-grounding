@@ -3,8 +3,8 @@
 # opencode-google-grounding-v2
 
 <p>
-  <strong>High-performance, LLM-grounded web search plugin for OpenCode V2</strong><br />
-  Powered by Google Gemini Search Grounding with academic-style inline citations and fault-tolerant fallback.
+  <strong>High-performance LLM Search Grounding Plugin built natively for OpenCode V2</strong><br />
+  Powered by Google Gemini Search Grounding with academic-style inline citations (<code>[1]</code>, <code>[2]</code>), clickable multi-source cards, system-wide WebSearch auto-routing, and persistent zero-overhead caching.
 </p>
 
 <p>
@@ -24,34 +24,67 @@
 
 ## 🌟 Overview
 
-`opencode-google-grounding-v2` is an official-specification OpenCode V2 plugin that equips your AI agents (Claude, DeepSeek, GPT, etc.) with real-time Google Web Search capabilities through Gemini Search Grounding.
+`opencode-google-grounding-v2` is a high-performance web search extension developed strictly following the OpenCode V2 plugin specification. Regardless of your active primary model (Claude, DeepSeek, GPT, or local models), this plugin equips it with real-time web search, fact verification, and source attribution capabilities.
 
-Unlike standard web search tools, it returns concise, fact-checked answers accompanied by **exact inline citation markers (`[1]`, `[2]`)** injected at precise UTF-8 byte offsets, followed by verified source URLs and executed search queries.
+Unlike standard web search tools, it returns concise, fact-checked answers accompanied by **academic-style inline citations (`[1]`, `[2]`)** calculated through a **UTF-8 byte offset reverse-slicing algorithm**, complete with verified source URLs and actual search queries.
 
 ---
 
 ## ✨ Features
 
 - **🚀 Native OpenCode V2 Architecture**: Built strictly on OpenCode V2's `id` + `setup(ctx)` lifecycle, integrating deeply with `ctx.tool`, `ctx.websearch`, `ctx.storage`, and `context.progress`.
-- **🌐 Tool + Websearch Dual Registration**:
-  - **Custom Tools**: Exposes `google_grounding` and `websearch_cited` under the Code Mode `search` namespace (`tools.search.google_grounding`).
-  - **System WebSearch Provider**: Automatically registers as an OpenCode V2 default `websearch` provider so any agent using native web search gets grounded facts.
-- **⚡ Native Persistent Caching (`ctx.storage`)**: Powered by OpenCode's sandboxed key-value store with configurable TTL (default 10m). Repeating queries return in 0ms with zero token cost and immunity to 429 limits.
+- **🌐 Dual-Entry Search Architecture (WebSearch + Custom Tool)**:
+  - **System WebSearch Provider (`ctx.websearch`)**: Automatically registers as an OpenCode V2 default `websearch` provider for seamless, transparent search in everyday conversations;
+  - **Custom Professional Tool (`ctx.tool`)**: Exposes `google_grounding` and `websearch_cited` under the Code Mode `search` namespace (`tools.search.google_grounding`) with full parameter control.
+- **🎯 Smart Anti-Bloat Slicing (Independent Clickable Cards)**:
+  - Every discovered source is rendered as an independent clickable card in the UI, allowing instant navigation to any specific webpage;
+  - The first card carries the complete synthesis report, while subsequent cards extract concise cited sentence snippets—**saving ~87.5% duplicate tokens (20,000+ context tokens saved per search)**.
+- **⚡ Native Persistent Caching (`ctx.storage`)**: Sandboxed key-value caching with configurable TTL (default 10m). Repeating queries return in 0ms with zero token cost and immunity to HTTP 429 limits.
 - **🔔 Live Progress Feedback (`context.progress`)**: Real-time status reporting in TUI and Web UI ("Searching Google...", "Found cached results", "Falling back to next model...").
-- **⚙️ Standardized `ctx.options` Configuration**: Structured plugin configuration via `opencode.jsonc` with support for `{env:VAR}` resolution.
+- **⚙️ Standardized `ctx.options` Configuration**: Structured plugin configuration via `opencode.jsonc` with support for `{env:VAR}` automatic resolution.
 - **⚡ Automatic Fallback Chain**: Built-in fault tolerance—configured with a generous 45s per-model timeout and 180s (3 min) total timeout. Automatically rotates through candidate models on rate limits (HTTP 429) or gateway blips (502/503), while immediately halting on fatal auth errors (401/403).
 - **🧠 Dynamic Model Switching & Normalization**: Supports runtime model selection per search call; automatically strips provider prefixes like `google/` to prevent 404s.
 - **📍 Academic-Style Precision Citations & Clean Markdown**: Calculates exact UTF-8 byte offsets from Gemini's `groundingSupports` with dynamic index remapping (preventing broken citations) and renders clean Markdown hyperlinks `[1] [Title](url)`.
 - **🌐 Reverse Proxy & Custom Gateway Ready**: Dual authentication support with both `x-goog-api-key` and `Authorization: Bearer`, ensuring seamless compatibility with OneAPI, NewAPI, and LAN gateways.
-- **🛡️ Safety & Truncation Transparency**: Operates as an independent tool and surfaces explicit provider block reasons (e.g. `SAFETY`) if content is filtered.
+
+---
+
+## 🔀 Dual Search Architecture
+
+The plugin provides two parallel search pathways to satisfy both transparent daily use and specialized scripted workflows:
+
+```
+                    User Prompt Input
+                            │
+            ┌───────────────┴───────────────┐
+            ▼                               ▼
+     [Normal Chat]                   [Specialized Prompt]
+  "What's the weather?"          "Search with gemini-3.8-flash"
+  "Review of RX 9070 XT"         "Batch query 3 items in Code Mode"
+            │                               │
+            ▼                               ▼
+ LLM calls websearch(...)        LLM calls google_grounding(...)
+            │                               │
+            ▼                               │
+ OpenCode Native Dispatch                   │
+(Handled by this plugin)                    │
+            │                               │
+            └───────────────┬───────────────┘
+                            ▼
+               Unified Google Grounding Engine
+      (Shares 45s timeouts, fallback chain, and cache)
+```
+
+| Entry Pathway | Invocation Method | Best For | Key Advantages |
+| :--- | :--- | :--- | :--- |
+| **System WebSearch** | LLM calls `websearch({ query })` | Normal chats, default agent browsing | **Completely transparent**. Renders multi-source clickable cards without duplicate token bloat. |
+| **Custom Professional Tool** | Call `google_grounding` or `tools.search.google_grounding` | Deep research, Code Mode batch scripts, custom models | **Advanced control**. Supports passing `model`, `context` guidelines, `max_sources`, etc. |
 
 ---
 
 ## 🛠️ Tool Signature
 
-The plugin registers two identical tools: `google_grounding` and `websearch_cited`.
-
-### Parameters
+When invoking via custom tools (`google_grounding` or `websearch_cited`), the following parameters are accepted:
 
 | Argument | Type | Required | Description |
 | :--- | :--- | :---: | :--- |
@@ -99,15 +132,17 @@ Configure plugin options directly in `~/.config/opencode/opencode.jsonc`:
 > If a model fails or hits rate limits, the plugin tries the next candidate automatically:
 > `[Requested Model] -> gemini-3.5-flash-lite -> gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.1-flash-lite -> gemini-3-flash-preview -> gemini-2.5-flash`.
 
-### 2. Base URL (API Gateway)
-1. `OPENCODE_GOOGLE_BASE_URL` environment variable.
-2. `providers.google.settings.baseURL` in `~/.config/opencode/opencode.jsonc`.
-3. Default: `https://generativelanguage.googleapis.com/v1beta` (Official Google API).
+### 3. Base URL (API Gateway)
+1. `options.baseURL` in `opencode.jsonc` plugin options.
+2. `OPENCODE_GOOGLE_BASE_URL` environment variable.
+3. `providers.google.settings.baseURL` in `~/.config/opencode/opencode.jsonc`.
+4. Default: `https://generativelanguage.googleapis.com/v1beta` (Official Google API).
 
-### 3. API Key
-1. `OPENCODE_GOOGLE_API_KEY` / `GOOGLE_API_KEY` / `GEMINI_API_KEY` environment variables.
-2. Stored OpenCode credentials in `~/.local/share/opencode/auth.json` (`google.key` or `indor.key`).
-3. `providers.google.settings.apiKey` in `opencode.jsonc`.
+### 4. API Key
+1. `options.apiKey` in `opencode.jsonc` plugin options (supports `{env:VAR}`).
+2. `OPENCODE_GOOGLE_API_KEY` / `GOOGLE_API_KEY` / `GEMINI_API_KEY` environment variables.
+3. Stored OpenCode credentials in `~/.local/share/opencode/auth.json` (`google.key` or `indor.key`).
+4. `providers.google.settings.apiKey` in `opencode.jsonc`.
 
 ---
 

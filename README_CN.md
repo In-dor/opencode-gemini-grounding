@@ -4,7 +4,7 @@
 
 <p>
   <strong>专为 OpenCode V2 打造的高性能 LLM 搜索接地（Grounding）插件</strong><br />
-  基于 Google Gemini 搜索接地能力，提供学术论文级精准行内角标（<code>[1]</code>, <code>[2]</code>）、来源链接与自动容灾降级。
+  基于 Google Gemini 搜索接地能力，提供学术论文级精准行内角标（<code>[1]</code>, <code>[2]</code>）、全量独立来源跳转、系统全局 WebSearch 自动接管与持久化零开销缓存。
 </p>
 
 <p>
@@ -24,32 +24,67 @@
 
 ## 🌟 概述
 
-`opencode-google-grounding-v2` 是遵循 OpenCode V2 官方最新规范开发的联网搜索扩展插件。无论当前会话的主力模型是 Claude、DeepSeek、GPT 还是其他本地模型，均可通过本插件一键赋予其实时联网检索、核实最新事实以及追溯原始网页来源的能力。
+`opencode-google-grounding-v2` 是遵循 OpenCode V2 官方最新规范开发的联网搜索扩展插件。无论当前会话的主力模型是 Claude、DeepSeek、GPT 还是本地模型，均可通过本插件一键赋予其实时联网检索、核实最新事实以及追溯原始网页来源的能力。
 
-与常见的粗粒度搜索引擎工具不同，本插件基于 Gemini Google Search Grounding，返回高度浓缩的事实总结，并利用 **UTF-8 字符字节偏移量算法** 将 **`[1]`、`[2]` 行内引用角标** 精准附着在对应事实的句尾，文末附带真实的网页来源和关键词检索记录。
+不同于传统的单网页爬虫，本插件基于 Google Gemini 原生 Search Grounding，返回高度浓缩的事实总结，并利用 **UTF-8 字符字节偏移量逆向切片算法** 将 **`[1]`、`[2]` 行内引用角标** 精准附着在对应事实的句尾，文末附带真实的网页来源和关键词检索记录。
 
 ---
 
 ## ✨ 核心特性
 
-- **🚀 原生适配 OpenCode V2 核心体系**：基于 V2 `id` + `setup(ctx)` 生命周期开发，同时深度对接 `ctx.tool`、`ctx.websearch`、`ctx.storage` 与 `context.progress`。
-- **🌐 Tool + Websearch 双体系注册**：
-  - **自定义工具**：暴露 `google_grounding` 与 `websearch_cited` 两个别名工具，并入驻 Code Mode 的 `search` 命名空间（`tools.search.google_grounding`）。
-  - **全局系统搜索引擎**：自动将 Google Gemini Grounding 注册并设为 OpenCode V2 全局默认的 `websearch` 提供商，任何使用内置网络搜索的 Agent 均能享受精准接地。
+- **🚀 原生适配 OpenCode V2 核心体系**：深度对接 V2 `id` + `setup(ctx)` 架构，同时覆盖 `ctx.tool`、`ctx.websearch`、`ctx.storage` 与 `context.progress`。
+- **🌐 双入口分流机制（WebSearch + Custom Tool）**：
+  - **全局系统搜索引擎（`ctx.websearch`）**：自动注册并设为 OpenCode 全局默认的 `websearch` 提供商，日常对话任何模型联网自动透明接管；
+  - **自定义专业工具（`ctx.tool`）**：暴露 `google_grounding` 与 `websearch_cited`，并入驻 Code Mode 的 `search` 命名空间（`tools.search.google_grounding`），支持动态传参。
+- **🎯 智能防膨胀切片（全量卡片独立跳转）**：
+  - 检索到的每个来源均在 UI 中呈现为独立可点击卡片，点选任意一张均能跳转真实原文网页；
+  - 首张卡片携带完整无删减报告保证模型上下文完整；后续卡片自动匹配引用句摘要，**相较粗暴复制单次节省约 87.5% 重复 Token（省下 20,000+ 上下文）**。
 - **⚡ 原生持久化缓存（`ctx.storage`）**：依托 OpenCode Server 原生沙盒存储实现 TTL 缓存（默认 10 分钟），重复提问秒级瞬返，零额外延迟、零 Token 开销、彻底免疫 429。
-- **🔔 实时进度与状态反馈（`context.progress`）**：在 TUI 终端与 Web 界面中动态显示“正在检索 Google...”、“已命中本地缓存”、“正在顺延降级至下一模型...”等友好进度条。
-- **⚙️ 标准化 `ctx.options` 支持**：支持在 `opencode.jsonc` 中直接为插件传入结构化 options 配置，配合 `{env:VAR}` 插值，免除硬编码与手动文件解析。
+- **🔔 实时动态进度条（`context.progress`）**：在 TUI 终端与 Web 界面中动态显示“正在检索 Google...”、“已命中本地缓存”、“正在降级至下一模型...”等实时状态。
+- **⚙️ 现代化 `ctx.options` 配置**：支持在 `opencode.jsonc` 中直接为插件传入结构化 options，原生支持 `{env:VAR}` 自动插值。
 - **⚡ 故障自动容灾降级链**：内置多模型备选梯队，单模型请求超时宽松设定为 45 秒，总超时 180 秒（3 分钟）。遇到限流（HTTP 429）或网关波动时自动无感顺延；遇到鉴权无效（HTTP 401/403）等致命错误立即终止，绝不盲目轮询浪费时间。
 - **🧠 动态模型即时切换与归一化**：支持在单次搜索时动态指定任意 Gemini 模型，自动兼容 `google/` 等前缀写法并完成格式归一化。
-- **📍 学术级精准角标排版与防断链**：解析底层的 `groundingSupports`，动态维护角标重映射（Remap），确保正文 `[1]`、`[2]` 与文末 Sources 严格一一对应；文末采用美观的 Markdown 超链接，告别超长重定向链接刷屏。
+- **📍 学术级精准角标排版**：解析底层的 `groundingSupports`，动态维护角标重映射（Remap），确保正文 `[1]`、`[2]` 与文末 Sources 严格一一对应；文末采用美观的 Markdown 超链接，告别超长重定向链接刷屏。
 - **🌐 深度兼容自建网关与中转**：同时支持原生 `x-goog-api-key` 与 `Authorization: Bearer` 请求头，完美兼容 OneAPI、NewAPI、Cloudflare AI Gateway 等第三方网关与反向代理。
-- **🛡️ 纯外挂零系统侵入与安全感知**：作为独立的自定义工具运行；若触发服务商安全策略拦截，清晰透出拦截原因（如 `SAFETY`），避免智能体误判为无搜索结果。
+
+---
+
+## 🔀 双搜索入口架构说明
+
+本插件提供了两套并行的搜索入口，分别满足日常透明调用与专业脚本化定制：
+
+```
+                    用户输入提问
+                         │
+         ┌───────────────┴───────────────┐
+         ▼                               ▼
+    【日常提问】                   【高级/特殊提问】
+ “今天北京天气怎么样”           “用 gemini-3.8 帮我查”
+ “9070xt 评测怎么样”            “在 Code Mode 批量查3个竞品”
+         │                               │
+         ▼                               ▼
+ 大模型调用 websearch(...)      大模型调用 google_grounding(...)
+         │                               │
+         ▼                               │
+ OpenCode 底层路由                       │
+（被本插件接管为全局默认）                 │
+         │                               │
+         └───────────────┬───────────────┘
+                         ▼
+             进入同一个 Google Grounding 引擎
+       （共享 45s 超时、容灾降级链与 ctx.storage 缓存）
+```
+
+| 入口方式 | 调用方法 | 适用场景 | 优势特点 |
+| :--- | :--- | :--- | :--- |
+| **系统全局 WebSearch** | 大模型自动调用 `websearch({ query })` | 日常对话、系统默认 Agent 联网 | **透明无感**。在 UI 中展示多张独立跳转卡片，且无重复 Token 膨胀。 |
+| **专业自定义工具** | 调用 `google_grounding` 或 `tools.search.google_grounding` | 深度调研、Code Mode 批量并发、指定顶级模型 | **高级可控**。支持动态传递 `model`、`context` 背景约束、`max_sources` 等。 |
 
 ---
 
 ## 🛠️ 工具参数说明
 
-插件注册了 `google_grounding` 与 `websearch_cited` 两个完全同义的工具：
+当通过自定义工具（`google_grounding` / `websearch_cited`）调用时，支持以下参数：
 
 | 参数名 | 类型 | 必填 | 说明 |
 | :--- | :--- | :---: | :--- |
@@ -75,7 +110,7 @@
       "options": {
         "model": "gemini-3.5-flash-lite",      // 默认首选检索模型
         "apiKey": "{env:GOOGLE_API_KEY}",       // 自动解析环境变量
-        "cacheTtlMs": 600000,                  // 本地持久化缓存时间（毫秒，默认10分钟，0为禁用）
+        "cacheTtlMs": 600000,                  // 本地持久化缓存时间（毫秒，默认10分钟，设为0禁用）
         "requestTimeoutMs": 45000,              // 单个模型请求超时时间（45秒）
         "timeoutMs": 180000,                    // 容灾降级总超时（3分钟）
         "setDefaultWebsearch": true             // 自动设为 OpenCode 全局默认 WebSearch 源
@@ -97,15 +132,17 @@
 > 若首选模型请求失败或触发频率限制，插件将按如下顺序自动降级重试：
 > `[请求模型] -> gemini-3.5-flash-lite -> gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.1-flash-lite -> gemini-3-flash-preview -> gemini-2.5-flash`。
 
-### 2. 接口基础地址（Base URL）
-1. 环境变量 `OPENCODE_GOOGLE_BASE_URL`；
-2. `~/.config/opencode/opencode.jsonc` 中的 `providers.google.settings.baseURL`；
-3. 默认值：`https://generativelanguage.googleapis.com/v1beta`（Google 官方端点）。
+### 3. 接口基础地址（Base URL）
+1. `opencode.jsonc` 插件选项 `options.baseURL`；
+2. 环境变量 `OPENCODE_GOOGLE_BASE_URL`；
+3. `~/.config/opencode/opencode.jsonc` 中的 `providers.google.settings.baseURL`；
+4. 默认值：`https://generativelanguage.googleapis.com/v1beta`（Google 官方端点）。
 
-### 3. API 密钥（API Key）
-1. 环境变量 `OPENCODE_GOOGLE_API_KEY` / `GOOGLE_API_KEY` / `GEMINI_API_KEY`；
-2. OpenCode 本地存储凭据 `~/.local/share/opencode/auth.json`（`google.key` 或 `indor.key`）；
-3. `opencode.jsonc` 中的 `providers.google.settings.apiKey`。
+### 4. API 密钥（API Key）
+1. `opencode.jsonc` 插件选项 `options.apiKey`（支持 `{env:VAR}` 占位符）；
+2. 环境变量 `OPENCODE_GOOGLE_API_KEY` / `GOOGLE_API_KEY` / `GEMINI_API_KEY`；
+3. OpenCode 本地存储凭据 `~/.local/share/opencode/auth.json`（`google.key` 或 `indor.key`）；
+4. `opencode.jsonc` 中的 `providers.google.settings.apiKey`。
 
 ---
 
