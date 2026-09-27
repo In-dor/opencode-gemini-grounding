@@ -90,6 +90,25 @@ async function reportProgress(progressFn, status) {
 }
 
 /**
+ * Extracts relevant snippet lines from grounded text that cite a specific source index [i].
+ */
+function extractSnippetForSource(displayIndex, text) {
+  if (!text || !displayIndex) return "";
+  const marker = `[${displayIndex}]`;
+  const lines = text.split("\n");
+  const matched = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("Sources:") || trimmed.startsWith("Search queries:")) break;
+    if (trimmed.includes(marker)) {
+      matched.push(trimmed.replace(/^[*#-]+\s*/, ""));
+      if (matched.length >= 2) break;
+    }
+  }
+  return matched.join(" ");
+}
+
+/**
  * Strips JSONC comments while respecting string literals.
  */
 function stripJsonComments(str) {
@@ -734,19 +753,31 @@ export default {
               }
             );
 
-            // Google Gemini Grounding produces a unified, coherent synthesis with inline citations
-            // and a complete Sources list. We return ONE consolidated result to prevent duplicating
-            // the full text across every source, which would bloat the prompt context by tens of
-            // thousands of tokens and duplicate cards in the UI.
-            const primaryUri = result.sources?.[0]?.uri || "https://google.com";
-            const primaryTitle = result.sources?.[0]?.title
-              ? `Google Gemini Grounding (${result.sources[0].title})`
-              : "Google Gemini Grounding Summary";
+            if (result.sources && result.sources.length > 0) {
+              return result.sources.map((s, idx) => {
+                const url = s.uri || "";
+                const title = s.title || `Source [${s.index}]`;
+                // Card 0 carries the full synthesis so the model receives all facts in complete context.
+                // Subsequent cards provide their own concise cited sentence snippets, avoiding the ~20,000-token
+                // duplicate bloat while ensuring every discovered source appears as an individual clickable card in the UI.
+                const snippet =
+                  idx === 0
+                    ? result.content
+                    : (extractSnippetForSource(s.index, result.content) || `Cited reference: ${title}`);
+
+                return {
+                  url,
+                  title,
+                  content: snippet,
+                  time: {},
+                };
+              });
+            }
 
             return [
               {
-                url: primaryUri,
-                title: primaryTitle,
+                url: "",
+                title: "Google Gemini Grounding Result",
                 content: result.content,
                 time: {},
               },
