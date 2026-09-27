@@ -36,9 +36,11 @@ Unlike standard web search tools, it returns concise, fact-checked answers accom
 - **🛡️ Zero Intrusiveness**: Operates as a completely independent custom tool without intercepting provider auth or modifying global request pipelines.
 - **🔄 Dual Tool Compatibility**: Exposes both `google_grounding` and `websearch_cited` to satisfy various prompt conventions.
 - **🧠 Dynamic Model Switching**: Supports runtime model selection per search call (`gemini-3.5-flash-lite`, `gemini-3.8-flash`, `gemini-3.1-pro-preview`, etc.).
-- **⚡ Automatic Fallback Chain**: Built-in fault tolerance—if the requested model encounters rate limits (HTTP 429) or gateway errors (502/503), it smoothly falls back through candidate models.
-- **📍 Academic-Style Precision Citations**: Calculates exact UTF-8 byte offsets from Gemini's `groundingSupports` to insert `[1]`, `[2]` right after each fact.
-- **🌐 Reverse Proxy & Custom Gateway Ready**: Seamlessly reads your existing `providers.google.settings.baseURL` (e.g. OneAPI / NewAPI / LAN gateway) and stored auth keys.
+- **⚡ Automatic Fallback Chain**: Built-in fault tolerance—configured with a generous 45s per-model timeout and 180s (3 min) total timeout. Automatically rotates through candidate models on rate limits (HTTP 429) or gateway blips (502/503), while immediately halting on fatal auth errors (401/403).
+- **🧠 Dynamic Model Switching & Normalization**: Supports runtime model selection per search call; automatically strips provider prefixes like `google/` to prevent 404s.
+- **📍 Academic-Style Precision Citations & Clean Markdown**: Calculates exact UTF-8 byte offsets from Gemini's `groundingSupports` with dynamic index remapping (preventing broken citations) and renders clean Markdown hyperlinks `[1] [Title](url)`.
+- **🌐 Reverse Proxy & Custom Gateway Ready**: Dual authentication support with both `x-goog-api-key` and `Authorization: Bearer`, ensuring seamless compatibility with OneAPI, NewAPI, and LAN gateways.
+- **🛡️ Safety & Truncation Transparency**: Operates as an independent tool and surfaces explicit provider block reasons (e.g. `SAFETY`) if content is filtered.
 
 ---
 
@@ -121,9 +123,9 @@ According to the latest meteorological bulletins, Beijing weather for today (Sep
 * **Wind**: Northerly winds around Force 3 with gusts reaching Force 5~6 during daytime[1].
 
 Sources:
-[1] bjd.com.cn (https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
-[2] weather.com.cn (https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
-[3] nmc.cn (https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
+[1] [Beijing Daily - Meteorological Bulletin](https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
+[2] [China Weather - Precipitation & Conditions](https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
+[3] [National Meteorological Center - Forecast](https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
 
 Search queries: Beijing weather September 27; Beijing meteorological bureau report
 ```

@@ -36,9 +36,11 @@
 - **🛡️ 纯外挂零系统侵入**：作为独立的自定义工具运行，不修改 Provider 认证拦截器，绝不引发登录或鉴权冲突。
 - **🔄 双工具名无缝兼容**：同时注册 `google_grounding` 与 `websearch_cited` 两个工具名，满足任意系统提示词或模型的调用习惯。
 - **🧠 动态模型即时切换**：支持在单次搜索时动态指定任意 Gemini 模型（如轻量高频使用 `gemini-3.5-flash-lite`，深度研究使用 `gemini-3.1-pro-preview` 等）。
-- **⚡ 故障自动容灾降级链**：内置多模型备选梯队，当所选模型遭遇并发限流（HTTP 429）或网关波动时，自动无感顺延尝试下一候选模型。
-- **📍 学术级精准角标排版**：解析底层的 `groundingSupports`，精确在对应事实句末嵌入角标，并在文末生成美观的 `Sources:` 链接列表。
-- **🌐 深度兼容自建网关与中转**：支持直接复用 `~/.config/opencode/opencode.jsonc` 中配置的局域网/反向代理地址（如 OneAPI、NewAPI）与已存凭据。
+- **⚡ 故障自动容灾降级链**：内置多模型备选梯队，单模型请求超时宽松设定为 45 秒，总超时 180 秒（3 分钟）。遇到限流（HTTP 429）或网关波动时自动无感顺延；遇到鉴权无效（HTTP 401/403）等致命错误立即终止，绝不盲目轮询浪费时间。
+- **🧠 动态模型即时切换与归一化**：支持在单次搜索时动态指定任意 Gemini 模型，自动兼容 `google/` 等前缀写法并完成格式归一化。
+- **📍 学术级精准角标排版与防断链**：解析底层的 `groundingSupports`，动态维护角标重映射（Remap），确保正文 `[1]`、`[2]` 与文末 Sources 严格一一对应；文末采用美观的 Markdown 超链接，告别超长重定向链接刷屏。
+- **🌐 深度兼容自建网关与中转**：同时支持原生 `x-goog-api-key` 与 `Authorization: Bearer` 请求头，完美兼容 OneAPI、NewAPI、Cloudflare AI Gateway 等第三方网关与反向代理。
+- **🛡️ 纯外挂零系统侵入与安全感知**：作为独立的自定义工具运行；若触发服务商安全策略拦截，清晰透出拦截原因（如 `SAFETY`），避免智能体误判为无搜索结果。
 
 ---
 
@@ -119,9 +121,9 @@ opencode plugin list
 * **风向风力**：白天偏北风3级，阵风可达 5~6级[1]
 
 Sources:
-[1] bjd.com.cn (https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
-[2] weather.com.cn (https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
-[3] nmc.cn (https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
+[1] [北京日报网 - 今日气象通报](https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
+[2] [中国天气网 - 降水与晴雨实况](https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
+[3] [国家气象中心 - 气温走势预警](https://vertexaisearch.cloud.google.com/grounding-api-redirect/...)
 
 Search queries: 北京天气 气象台 2026年9月27日
 ```
