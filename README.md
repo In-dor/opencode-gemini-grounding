@@ -130,6 +130,15 @@ Search queries: Beijing weather September 27; Beijing meteorological bureau repo
 
 ---
 
+## 🙏 Acknowledgements
+
+This project builds upon the ideas and implementations of two pioneering OpenCode V1 plugins:
+
+- **[ghoulr/opencode-websearch-cited](https://github.com/ghoulr/opencode-websearch-cited)** by [@ghoulr](https://github.com/ghoulr): For the brilliant concept of LLM-grounded search with academic-style inline citations (`[1]`, `[2]`), and the UTF-8 byte offset insertion algorithm for `groundingSupports`.
+- **[janaki-sasidhar/opencode-google-grounding](https://github.com/janaki-sasidhar/opencode-google-grounding)** by [@janaki-sasidhar](https://github.com/janaki-sasidhar): For the lightweight, zero-intrusive standalone tool design, Gemini Search Grounding integration, and flexible custom `baseURL` / proxy resolution.
+
+---
+
 ## 📄 License
 
 Distributed under the [MIT License](./LICENSE).

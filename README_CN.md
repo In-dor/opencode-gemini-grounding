@@ -128,6 +128,15 @@ Search queries: 北京天气 气象台 2026年9月27日
 
 ---
 
+## 🙏 致谢（Acknowledgements）
+
+本项目在设计与实现过程中，吸纳并借鉴了两个优秀的 OpenCode V1 前辈开源项目的核心思想：
+
+- **[ghoulr/opencode-websearch-cited](https://github.com/ghoulr/opencode-websearch-cited)**（作者：[@ghoulr](https://github.com/ghoulr)）：启发了学术论文级的行内引用格式（`[1]`、`[2]`）设计，以及基于 `groundingSupports` 的 UTF-8 字节偏移量切片插入算法。
+- **[janaki-sasidhar/opencode-google-grounding](https://github.com/janaki-sasidhar/opencode-google-grounding)**（作者：[@janaki-sasidhar](https://github.com/janaki-sasidhar)）：启发了纯外挂、零侵入的独立 Custom Tool 架构设计，以及对自定义 `baseURL` 代理网关的灵活解析机制。
+
+---
+
 ## 📄 许可证
 
 基于 [MIT License](./LICENSE) 开源发布。
