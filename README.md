@@ -51,7 +51,7 @@ The plugin registers two identical tools: `google_grounding` and `websearch_cite
 | Argument | Type | Required | Description |
 | :--- | :--- | :---: | :--- |
 | `query` | `string` | **Yes** | The question or natural language search query. |
-| `model` | `string` | No | Optional Gemini model ID (e.g. `gemini-3.5-flash-lite`, `gemini-3.8-flash`, `gemini-3.1-pro-preview`). Defaults to configured model. |
+| `model` | `string` | No | Optional Gemini model ID (e.g. `gemini-3.5-flash-lite`, `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.1-flash-lite`). Defaults to configured model. |
 | `context` | `string` | No | Optional extra background, constraints, or guidelines for the search. |
 | `max_sources` | `number` | No | Maximum number of grounded source links to return (1-20, default: `8`). |
 
@@ -66,11 +66,11 @@ The plugin resolves connection parameters in the following order:
 2. `OPENCODE_GOOGLE_MODEL` environment variable.
 3. `providers.google.model` or `providers.google.settings.model` in `~/.config/opencode/opencode.jsonc`.
 4. `providers.google.options.websearch_cited.model`.
-5. Default fallback: `gemini-3.8-flash`.
+5. Default fallback: `gemini-3.5-flash-lite`.
 
 > **Automatic Fallback Chain**:
 > If a model fails or hits rate limits, the plugin tries the next candidate automatically:
-> `[Requested Model] -> gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.5-flash-lite -> gemini-3-flash-preview -> gemini-2.5-flash`.
+> `[Requested Model] -> gemini-3.5-flash-lite -> gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.1-flash-lite -> gemini-3-flash-preview -> gemini-2.5-flash`.
 
 ### 2. Base URL (API Gateway)
 1. `OPENCODE_GOOGLE_BASE_URL` environment variable.

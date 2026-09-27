@@ -2,14 +2,15 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-const DEFAULT_MODEL = "gemini-3.8-flash";
+const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 
 // Default fallback chain when the primary model fails or encounters rate limits
 const DEFAULT_FALLBACK_MODELS = [
+  "gemini-3.5-flash-lite",
   "gemini-3.8-flash",
   "gemini-3.7-flash",
-  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
   "gemini-3-flash-preview",
   "gemini-2.5-flash",
 ];
@@ -111,7 +112,7 @@ function resolveConfig() {
   // 1. env OPENCODE_GOOGLE_MODEL
   // 2. providers.google.model / settings.model
   // 3. providers.google.options.websearch_cited.model / options.model
-  // 4. DEFAULT_MODEL (gemini-3.8-flash)
+  // 4. DEFAULT_MODEL (gemini-3.5-flash-lite)
   const model =
     process.env.OPENCODE_GOOGLE_MODEL ||
     googleProvider?.model ||
@@ -352,7 +353,7 @@ export default {
             model: {
               type: "string",
               description:
-                "Optional Gemini model ID for grounding (e.g. 'gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.7-flash', 'gemini-3.1-pro-preview'). Defaults to configured model with automatic fallback.",
+                "Optional Gemini model ID for grounding (e.g. 'gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.1-flash-lite'). Defaults to configured model with automatic fallback.",
             },
             max_sources: {
               type: "number",

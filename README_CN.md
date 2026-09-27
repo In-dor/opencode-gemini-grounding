@@ -64,11 +64,11 @@
 2. 环境变量 `OPENCODE_GOOGLE_MODEL`；
 3. `opencode.jsonc` 中的 `providers.google.model` 或 `settings.model`；
 4. `opencode.jsonc` 中的 `providers.google.options.websearch_cited.model`；
-5. 默认回退值：`gemini-3.8-flash`。
+5. 默认回退值：`gemini-3.5-flash-lite`。
 
 > **容灾降级链机制**：
 > 若首选模型请求失败或触发频率限制，插件将按如下顺序自动降级重试：
-> `[请求模型] -> gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.5-flash-lite -> gemini-3-flash-preview -> gemini-2.5-flash`。
+> `[请求模型] -> gemini-3.5-flash-lite -> gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.1-flash-lite -> gemini-3-flash-preview -> gemini-2.5-flash`。
 
 ### 2. 接口基础地址（Base URL）
 1. 环境变量 `OPENCODE_GOOGLE_BASE_URL`；
