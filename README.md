@@ -8,10 +8,12 @@
 </p>
 
 <p>
+  <a href="https://www.npmjs.com/package/opencode-gemini-grounding"><img src="https://img.shields.io/npm/v/opencode-gemini-grounding?color=blue&style=flat-square" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/opencode-gemini-grounding"><img src="https://img.shields.io/npm/dt/opencode-gemini-grounding?color=brightgreen&style=flat-square" alt="npm downloads" /></a>
   <a href="https://opencode.ai"><img src="https://img.shields.io/badge/OpenCode-V2%20Compatible-4F46E5?style=flat-square" alt="OpenCode V2" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License" /></a>
+  <img src="https://img.shields.io/badge/Dependencies-Zero-success?style=flat-square" alt="Zero Dependencies" />
   <img src="https://img.shields.io/badge/ESM-Native-blue.svg?style=flat-square" alt="ESM" />
-  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform" />
 </p>
 
 <p>
@@ -53,7 +55,7 @@ Unlike standard web search tools, it returns concise, fact-checked answers accom
 
 The plugin provides two parallel search pathways to satisfy both transparent daily use and specialized scripted workflows:
 
-```
+```text
                     User Prompt Input
                             │
             ┌───────────────┴───────────────┐
@@ -82,6 +84,67 @@ The plugin provides two parallel search pathways to satisfy both transparent dai
 
 ---
 
+## 📦 Installation & Usage
+
+### Method 1: npm Package (Recommended · Zero-Config)
+
+No cloning or manual symlinks needed. Add the plugin directly to the `plugins` array in your OpenCode configuration `~/.config/opencode/opencode.jsonc` (on Windows: `%USERPROFILE%\.config\opencode\opencode.jsonc`):
+
+#### 1. Basic Setup
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    "opencode-gemini-grounding"
+  ]
+}
+```
+
+#### 2. Advanced Setup with Options (Recommended)
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "opencode-gemini-grounding",
+      "options": {
+        "model": "gemini-3.5-flash-lite",      // Preferred search model
+        "apiKey": "{env:GOOGLE_API_KEY}",       // Auto-resolved from environment
+        "cacheTtlMs": 600000,                  // Storage cache TTL in ms (default 10m; 0 disables)
+        "requestTimeoutMs": 45000,              // Single-model timeout (45s)
+        "timeoutMs": 180000,                    // Total fallback chain timeout (3m)
+        "setDefaultWebsearch": true             // Set as default OpenCode V2 websearch provider
+      }
+    }
+  ]
+}
+```
+
+---
+
+### Method 2: Local Development Setup (For Contributors)
+
+For local development or testing modifications:
+
+#### Global Plugin Bridge
+Create `~/.config/opencode/plugins/google-grounding.js`:
+```javascript
+export { default } from "file:///D:/OpenCode/opencode-gemini-grounding/index.js";
+```
+
+#### Or Directory Junction / Symlink
+```powershell
+# Windows (PowerShell)
+cmd /c mklink /J "$env:USERPROFILE\.config\opencode\plugins\opencode-gemini-grounding" "D:\OpenCode\opencode-gemini-grounding"
+```
+
+Verify that OpenCode recognizes the plugin:
+```bash
+opencode plugin list
+```
+
+---
+
 ## 🛠️ Tool Signature
 
 When invoking via custom tools (`google_grounding` or `websearch_cited`), the following parameters are accepted:
@@ -97,30 +160,7 @@ When invoking via custom tools (`google_grounding` or `websearch_cited`), the fo
 
 ## ⚙️ Configuration & Priority
 
-### 1. Modern Plugin Options (`opencode.jsonc`)
-
-Configure plugin options directly in `~/.config/opencode/opencode.jsonc`:
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    {
-      "package": "opencode-gemini-grounding",
-      "options": {
-        "model": "gemini-3.5-flash-lite",      // Primary grounding model
-        "apiKey": "{env:GOOGLE_API_KEY}",       // Auto-resolved environment variable
-        "cacheTtlMs": 600000,                  // Storage cache duration (ms, default 10m; 0 disables)
-        "requestTimeoutMs": 45000,              // Single-model timeout (45s)
-        "timeoutMs": 180000,                    // Total fallback chain timeout (3m)
-        "setDefaultWebsearch": true             // Register as default OpenCode V2 websearch provider
-      }
-    }
-  ]
-}
-```
-
-### 2. Model Resolution
+### 1. Model Resolution
 1. Dynamic `model` argument provided in the tool call.
 2. `options.model` in `opencode.jsonc` plugin options.
 3. `OPENCODE_GOOGLE_MODEL` environment variable.
@@ -132,44 +172,17 @@ Configure plugin options directly in `~/.config/opencode/opencode.jsonc`:
 > If a model fails or hits rate limits, the plugin tries the next candidate automatically:
 > `[Requested Model] -> gemini-3.5-flash-lite -> gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.1-flash-lite -> gemini-3-flash-preview -> gemini-2.5-flash`.
 
-### 3. Base URL (API Gateway)
+### 2. Base URL (API Gateway)
 1. `options.baseURL` in `opencode.jsonc` plugin options.
 2. `OPENCODE_GOOGLE_BASE_URL` environment variable.
 3. `providers.google.settings.baseURL` in `~/.config/opencode/opencode.jsonc`.
 4. Default: `https://generativelanguage.googleapis.com/v1beta` (Official Google API).
 
-### 4. API Key
+### 3. API Key
 1. `options.apiKey` in `opencode.jsonc` plugin options (supports `{env:VAR}`).
 2. `OPENCODE_GOOGLE_API_KEY` / `GOOGLE_API_KEY` / `GEMINI_API_KEY` environment variables.
 3. Stored OpenCode credentials in `~/.local/share/opencode/auth.json` (`google.key` or `indor.key`).
 4. `providers.google.settings.apiKey` in `opencode.jsonc`.
-
----
-
-## 📦 Installation in OpenCode V2
-
-### Method 1: Global Plugin Bridge (Recommended)
-
-Create `~/.config/opencode/plugins/google-grounding.js` and re-export this repository:
-
-```javascript
-export { default } from "file:///D:/OpenCode/opencode-gemini-grounding/index.js";
-```
-
-### Method 2: Directory Junction / Symlink
-
-Link this repository folder directly into OpenCode's plugin directory:
-
-```powershell
-# Windows (PowerShell / Command Prompt)
-cmd /c mklink /J "$env:USERPROFILE\.config\opencode\plugins\opencode-gemini-grounding" "D:\OpenCode\opencode-gemini-grounding"
-```
-
-Verify that the plugin is recognized:
-
-```bash
-opencode plugin list
-```
 
 ---
 

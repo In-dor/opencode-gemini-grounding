@@ -4,14 +4,16 @@
 
 <p>
   <strong>专为 OpenCode V2 打造的高性能 LLM 搜索接地（Grounding）插件</strong><br />
-  基于 Google Gemini 搜索接地能力，提供学术论文级精准行内角标（<code>[1]</code>, <code>[2]</code>）、全量独立来源跳转、系统全局 WebSearch 自动接管与持久化零开销缓存。
+  基于 Google Gemini 搜索接地能力，提供学术论文级精准行内角标（<code>[1]</code>, <code>[2]</code>）、全量独立来源卡片跳转、系统全局 WebSearch 自动接管与持久化零开销缓存。
 </p>
 
 <p>
+  <a href="https://www.npmjs.com/package/opencode-gemini-grounding"><img src="https://img.shields.io/npm/v/opencode-gemini-grounding?color=blue&style=flat-square" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/opencode-gemini-grounding"><img src="https://img.shields.io/npm/dt/opencode-gemini-grounding?color=brightgreen&style=flat-square" alt="npm downloads" /></a>
   <a href="https://opencode.ai"><img src="https://img.shields.io/badge/OpenCode-V2%20兼容-4F46E5?style=flat-square" alt="OpenCode V2" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License" /></a>
+  <img src="https://img.shields.io/badge/依赖-Zero%20Dependencies-success?style=flat-square" alt="Zero Dependencies" />
   <img src="https://img.shields.io/badge/ESM-原生支持-blue.svg?style=flat-square" alt="ESM" />
-  <img src="https://img.shields.io/badge/平台-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform" />
 </p>
 
 <p>
@@ -26,7 +28,7 @@
 
 `opencode-gemini-grounding` 是遵循 OpenCode V2 官方最新规范开发的联网搜索扩展插件。无论当前会话的主力模型是 Claude、DeepSeek、GPT 还是本地模型，均可通过本插件一键赋予其实时联网检索、核实最新事实以及追溯原始网页来源的能力。
 
-不同于传统的单网页爬虫，本插件基于 Google Gemini 原生 Search Grounding，返回高度浓缩的事实总结，并利用 **UTF-8 字符字节偏移量逆向切片算法** 将 **`[1]`、`[2]` 行内引用角标** 精准附着在对应事实的句尾，文末附带真实的网页来源和关键词检索记录。
+不同于传统的单网页粗粒度爬虫，本插件基于 Google Gemini 原生 Search Grounding，返回高度浓缩的事实总结，并利用 **UTF-8 字符字节偏移量逆向切片算法** 将 **`[1]`、`[2]` 行内引用角标** 精准附着在对应事实的句尾，文末附带真实的网页来源和关键词检索记录。
 
 ---
 
@@ -38,7 +40,7 @@
   - **自定义专业工具（`ctx.tool`）**：暴露 `google_grounding` 与 `websearch_cited`，并入驻 Code Mode 的 `search` 命名空间（`tools.search.google_grounding`），支持动态传参。
 - **🎯 智能防膨胀切片（全量卡片独立跳转）**：
   - 检索到的每个来源均在 UI 中呈现为独立可点击卡片，点选任意一张均能跳转真实原文网页；
-  - 首张卡片携带完整无删减报告保证模型上下文完整；后续卡片自动匹配引用句摘要，**相较粗暴复制单次节省约 87.5% 重复 Token（省下 20,000+ 上下文）**。
+  - 首张卡片携带完整无删减报告保证模型上下文完整；后续卡片自动匹配专属引用句摘要，**相较粗暴复制单次节省约 87.5% 重复 Token（省下 20,000+ 上下文）**。
 - **⚡ 原生持久化缓存（`ctx.storage`）**：依托 OpenCode Server 原生沙盒存储实现 TTL 缓存（默认 10 分钟），重复提问秒级瞬返，零额外延迟、零 Token 开销、彻底免疫 429。
 - **🔔 实时动态进度条（`context.progress`）**：在 TUI 终端与 Web 界面中动态显示“正在检索 Google...”、“已命中本地缓存”、“正在降级至下一模型...”等实时状态。
 - **⚙️ 现代化 `ctx.options` 配置**：支持在 `opencode.jsonc` 中直接为插件传入结构化 options，原生支持 `{env:VAR}` 自动插值。
@@ -53,7 +55,7 @@
 
 本插件提供了两套并行的搜索入口，分别满足日常透明调用与专业脚本化定制：
 
-```
+```text
                     用户输入提问
                          │
          ┌───────────────┴───────────────┐
@@ -82,6 +84,67 @@
 
 ---
 
+## 📦 安装与使用方式（Installation）
+
+### 方式一：npm 官方包引入（强烈推荐·开箱即用）
+
+无需 clone 源码或手动配置软链接，直接在 OpenCode 配置文件 `~/.config/opencode/opencode.jsonc`（Windows 为 `%USERPROFILE%\.config\opencode\opencode.jsonc`）的 `plugins` 列表中添加本插件即可：
+
+#### 1. 基础极简配置
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    "opencode-gemini-grounding"
+  ]
+}
+```
+
+#### 2. 带自定义选项的高级配置（推荐）
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "opencode-gemini-grounding",
+      "options": {
+        "model": "gemini-3.5-flash-lite",      // 默认首选检索模型
+        "apiKey": "{env:GOOGLE_API_KEY}",       // 自动从环境变量解析 API 密钥
+        "cacheTtlMs": 600000,                  // 本地持久化缓存时间（毫秒，默认 10 分钟，设为 0 禁用）
+        "requestTimeoutMs": 45000,              // 单个模型请求超时时间（45 秒）
+        "timeoutMs": 180000,                    // 容灾降级总超时（3 分钟）
+        "setDefaultWebsearch": true             // 自动设为 OpenCode 全局默认 WebSearch 源
+      }
+    }
+  ]
+}
+```
+
+---
+
+### 方式二：本地开发调试模式（面向开发者）
+
+如果你正在开发、调试或为本项目贡献代码，可以通过以下本地方式加载：
+
+#### 全局插件重导出桥接
+在 OpenCode 全局插件目录新建 `~/.config/opencode/plugins/google-grounding.js`：
+```javascript
+export { default } from "file:///D:/OpenCode/opencode-gemini-grounding/index.js";
+```
+
+#### 或目录软链接（Junction）
+```powershell
+# Windows 环境（PowerShell）
+cmd /c mklink /J "$env:USERPROFILE\.config\opencode\plugins\opencode-gemini-grounding" "D:\OpenCode\opencode-gemini-grounding"
+```
+
+验证插件是否已被 OpenCode 识别：
+```bash
+opencode plugin list
+```
+
+---
+
 ## 🛠️ 工具参数说明
 
 当通过自定义工具（`google_grounding` / `websearch_cited`）调用时，支持以下参数：
@@ -97,30 +160,7 @@
 
 ## ⚙️ 配置与优先级规则
 
-### 1. 现代化插件选项配置（推荐，`opencode.jsonc`）
-
-你可以直接在 `~/.config/opencode/opencode.jsonc` 中配置插件专属选项：
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    {
-      "package": "opencode-gemini-grounding",
-      "options": {
-        "model": "gemini-3.5-flash-lite",      // 默认首选检索模型
-        "apiKey": "{env:GOOGLE_API_KEY}",       // 自动解析环境变量
-        "cacheTtlMs": 600000,                  // 本地持久化缓存时间（毫秒，默认10分钟，设为0禁用）
-        "requestTimeoutMs": 45000,              // 单个模型请求超时时间（45秒）
-        "timeoutMs": 180000,                    // 容灾降级总超时（3分钟）
-        "setDefaultWebsearch": true             // 自动设为 OpenCode 全局默认 WebSearch 源
-      }
-    }
-  ]
-}
-```
-
-### 2. 模型选择优先级（Model）
+### 1. 模型选择优先级（Model）
 1. 本次工具调用动态传入的 `model` 参数；
 2. `opencode.jsonc` 插件选项 `options.model`；
 3. 环境变量 `OPENCODE_GOOGLE_MODEL`；
@@ -132,13 +172,13 @@
 > 若首选模型请求失败或触发频率限制，插件将按如下顺序自动降级重试：
 > `[请求模型] -> gemini-3.5-flash-lite -> gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.1-flash-lite -> gemini-3-flash-preview -> gemini-2.5-flash`。
 
-### 3. 接口基础地址（Base URL）
+### 2. 接口基础地址（Base URL）
 1. `opencode.jsonc` 插件选项 `options.baseURL`；
 2. 环境变量 `OPENCODE_GOOGLE_BASE_URL`；
 3. `~/.config/opencode/opencode.jsonc` 中的 `providers.google.settings.baseURL`；
 4. 默认值：`https://generativelanguage.googleapis.com/v1beta`（Google 官方端点）。
 
-### 4. API 密钥（API Key）
+### 3. API 密钥（API Key）
 1. `opencode.jsonc` 插件选项 `options.apiKey`（支持 `{env:VAR}` 占位符）；
 2. 环境变量 `OPENCODE_GOOGLE_API_KEY` / `GOOGLE_API_KEY` / `GEMINI_API_KEY`；
 3. OpenCode 本地存储凭据 `~/.local/share/opencode/auth.json`（`google.key` 或 `indor.key`）；
@@ -146,34 +186,7 @@
 
 ---
 
-## 📦 本地引入方式
-
-### 方式一：全局插件重导出桥接（推荐）
-
-在 OpenCode 全局插件目录新建 `~/.config/opencode/plugins/google-grounding.js`，指向本仓库入口：
-
-```javascript
-export { default } from "file:///D:/OpenCode/opencode-gemini-grounding/index.js";
-```
-
-### 方式二：目录软链接（Junction）
-
-直接将本仓库目录挂载到 OpenCode 全局插件目录下：
-
-```powershell
-# Windows 环境（PowerShell）
-cmd /c mklink /J "$env:USERPROFILE\.config\opencode\plugins\opencode-gemini-grounding" "D:\OpenCode\opencode-gemini-grounding"
-```
-
-验证插件是否已被 OpenCode 识别：
-
-```bash
-opencode plugin list
-```
-
----
-
-## 📝 输出示例
+## 📝 输出效果展示
 
 ```markdown
 根据北京市气象台发布的最新预报，北京今日（9月27日）天气概况如下[1]：
