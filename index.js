@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
@@ -9,6 +10,7 @@ const DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1bet
 const DEFAULT_REQUEST_TIMEOUT_MS = 45000;
 const DEFAULT_TOTAL_TIMEOUT_MS = 180000;
 const DEFAULT_CACHE_TTL_MS = 600000;
+const MAX_SNIPPET_LENGTH = 280;
 
 // Default fallback chain when the primary model fails or encounters rate limits
 const DEFAULT_FALLBACK_MODELS = [
@@ -20,10 +22,16 @@ const DEFAULT_FALLBACK_MODELS = [
   "gemini-2.5-flash",
 ];
 
+// In-memory file cache keyed by filePath -> { mtimeMs, data }
+const jsonFileCache = new Map();
+
+// In-flight request deduplication map keyed by cacheKey -> Promise
+const inFlightRequests = new Map();
+
 /**
- * Custom error class for non-retryable fatal client / auth errors.
+ * Custom error class for non-retryable fatal authentication or client errors.
  */
-class FatalError extends Error {
+export class FatalError extends Error {
   constructor(message, status) {
     super(message);
     this.name = "FatalError";
@@ -34,7 +42,7 @@ class FatalError extends Error {
 /**
  * Normalizes a model identifier by stripping provider prefixes like 'google/' or 'indor/'.
  */
-function normalizeModelId(modelId) {
+export function normalizeModelId(modelId) {
   if (!modelId || typeof modelId !== "string") return "";
   let clean = modelId.trim();
   if (clean.includes("/")) {
@@ -44,36 +52,50 @@ function normalizeModelId(modelId) {
 }
 
 /**
- * Resolves potential '{env:VAR_NAME}' placeholders.
+ * Resolves '{env:VAR_NAME}' placeholders (both standalone and embedded in strings).
  */
-function resolveEnvPlaceholder(val) {
+export function resolveEnvPlaceholder(val) {
   if (typeof val !== "string") return val;
-  const match = val.match(/^\{env:([A-Za-z0-9_]+)\}$/);
-  if (match) {
-    return process.env[match[1]] || "";
-  }
-  return val;
+  return val.replace(/\{env:([A-Za-z0-9_]+)\}/g, (_, name) => process.env[name] || "");
 }
 
 /**
- * Fast string hashing for cache keys.
+ * Normalizes a Gemini API baseURL:
+ * - Resolves '{env:VAR}' placeholders
+ * - Strips trailing slashes and accidental '/models' suffix
+ * - Automatically appends '/v1beta' if the URL has only a root pathname ('/')
  */
-function hashString(str) {
-  let hash = 5381;
-  for (let i = 0; i < str.length; i++) {
-    hash = (hash * 33) ^ str.charCodeAt(i);
+export function normalizeBaseUrl(rawUrl) {
+  const resolved = resolveEnvPlaceholder(rawUrl || "").trim().replace(/\/+$/, "");
+  if (!resolved) return DEFAULT_GEMINI_BASE_URL;
+
+  const withoutModels = resolved.replace(/\/models$/i, "");
+  if (/\/v1(?:beta|alpha)?$/i.test(withoutModels)) {
+    return withoutModels;
   }
-  return (hash >>> 0).toString(36);
+
+  try {
+    const parsed = new URL(withoutModels);
+    if (!parsed.pathname || parsed.pathname === "/") {
+      return `${withoutModels}/v1beta`;
+    }
+  } catch {
+    // Keep as-is if not a standard URL
+  }
+  return withoutModels;
 }
 
 /**
- * Computes a unique cache key based on query and context.
+ * Computes a collision-resistant SHA-256 cache key across query, context, model, and maxSources.
  */
-function makeCacheKey(query, context) {
-  const normQuery = (query || "").trim().toLowerCase();
-  const normContext = (context || "").trim().toLowerCase();
-  const hash = hashString(`${normQuery}::${normContext}`);
-  return `cache:v1:grounding:${hash}`;
+export function makeCacheKey(query, context = "", model = "", maxSources = 8) {
+  const normQuery = String(query || "").trim().toLowerCase();
+  const normContext = String(context || "").trim().toLowerCase();
+  const normModel = normalizeModelId(model).toLowerCase();
+  const normMax = Number(maxSources) || 8;
+  const payload = JSON.stringify([normQuery, normContext, normModel, normMax]);
+  const hash = crypto.createHash("sha256").update(payload).digest("hex").slice(0, 32);
+  return `cache:v2:grounding:${hash}`;
 }
 
 /**
@@ -90,46 +112,79 @@ async function reportProgress(progressFn, status) {
 }
 
 /**
- * Extracts relevant snippet lines from grounded text that cite a specific source index [i].
+ * Extracts concise sentence-level snippets from grounded text that cite a specific source index [i].
  */
-function extractSnippetForSource(displayIndex, text) {
+export function extractSnippetForSource(displayIndex, text) {
   if (!text || !displayIndex) return "";
   const marker = `[${displayIndex}]`;
   const lines = text.split("\n");
   const matched = [];
+
   for (const line of lines) {
     const trimmed = line.trim();
+    if (!trimmed) continue;
     if (trimmed.startsWith("Sources:") || trimmed.startsWith("Search queries:")) break;
-    if (trimmed.includes(marker)) {
-      matched.push(trimmed.replace(/^[*#-]+\s*/, ""));
-      if (matched.length >= 2) break;
+    if (!trimmed.includes(marker)) continue;
+
+    // Strip markdown list bullets, numbered lists, headings, and blockquotes
+    const cleanLine = trimmed.replace(/^(?:[*+-]|\d+[.)]|#+|>)\s*/, "").trim();
+
+    if (cleanLine.length <= 60) {
+      matched.push(cleanLine);
+    } else {
+      // Split into sentences while keeping citation markers [i] and punctuation grouped together
+      const sentences = cleanLine
+        .split(
+          /(?<=[。！？!?])(?![\d\[\]])\s*|(?<=(?:\[\d+\])+)(?![\d\[\]。！？.!?])\s*|(?<=\.)(?=\s+[A-Z\u4e00-\u9fa5])\s*/g
+        )
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      for (const sentence of sentences) {
+        if (sentence.includes(marker)) {
+          matched.push(sentence);
+          if (matched.length >= 2) break;
+        }
+      }
     }
+
+    if (matched.length >= 2) break;
   }
-  return matched.join(" ");
+
+  const combined = matched.join(" ").trim();
+  if (combined.length > MAX_SNIPPET_LENGTH) {
+    return `${combined.slice(0, MAX_SNIPPET_LENGTH - 3).trim()}...`;
+  }
+  return combined;
 }
 
 /**
- * Strips JSONC comments while respecting string literals.
+ * Strips JSONC comments (// and /* *\/) AND trailing commas before } or ] while respecting string literals.
  */
-function stripJsonComments(str) {
+export function stripJsonComments(str) {
+  if (typeof str !== "string") return "";
+
+  // Pass 1: Remove single-line and multi-line comments outside string literals
   let inString = false;
   let inSingleComment = false;
   let inMultiComment = false;
-  let out = "";
+  let noComments = "";
+
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
     const next = str[i + 1];
+
     if (inString) {
-      out += ch;
+      noComments += ch;
       if (ch === "\\" && i + 1 < str.length) {
-        out += str[++i];
+        noComments += str[++i];
       } else if (ch === '"') {
         inString = false;
       }
     } else if (inSingleComment) {
       if (ch === "\n") {
         inSingleComment = false;
-        out += ch;
+        noComments += ch;
       }
     } else if (inMultiComment) {
       if (ch === "*" && next === "/") {
@@ -139,7 +194,7 @@ function stripJsonComments(str) {
     } else {
       if (ch === '"') {
         inString = true;
-        out += ch;
+        noComments += ch;
       } else if (ch === "/" && next === "/") {
         inSingleComment = true;
         i++;
@@ -147,36 +202,85 @@ function stripJsonComments(str) {
         inMultiComment = true;
         i++;
       } else {
+        noComments += ch;
+      }
+    }
+  }
+
+  // Pass 2: Remove trailing commas before } or ] outside string literals
+  let out = "";
+  inString = false;
+  for (let i = 0; i < noComments.length; i++) {
+    const ch = noComments[i];
+    if (inString) {
+      out += ch;
+      if (ch === "\\" && i + 1 < noComments.length) {
+        out += noComments[++i];
+      } else if (ch === '"') {
+        inString = false;
+      }
+    } else {
+      if (ch === '"') {
+        inString = true;
+        out += ch;
+      } else if (ch === ",") {
+        let j = i + 1;
+        while (j < noComments.length && /\s/.test(noComments[j])) {
+          j++;
+        }
+        const nextNonWs = noComments[j];
+        if (nextNonWs === "}" || nextNonWs === "]") {
+          // Skip trailing comma
+          continue;
+        }
+        out += ch;
+      } else {
         out += ch;
       }
     }
   }
+
   return out;
 }
 
 /**
- * Reads and parses a JSON or JSONC file safely.
+ * Reads and parses a JSON or JSONC file safely with mtimeMs-based in-memory caching.
  */
 function readJsonFile(filePath) {
   try {
-    if (!fs.existsSync(filePath)) return null;
+    const stat = fs.statSync(filePath);
+    const cached = jsonFileCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs) {
+      return cached.data;
+    }
+
     const content = fs.readFileSync(filePath, "utf-8");
     const clean = stripJsonComments(content);
-    return JSON.parse(clean);
+    const data = JSON.parse(clean);
+    jsonFileCache.set(filePath, { mtimeMs: stat.mtimeMs, data });
+    return data;
   } catch {
+    jsonFileCache.delete(filePath);
     return null;
   }
 }
 
 /**
  * Resolves connection settings with full support for OpenCode V2 ctx.options,
- * environment variables, opencode.jsonc, and auth.json.
+ * environment variables, XDG directories, opencode.jsonc, and auth.json.
  */
-function resolveConfig(pluginOptions = {}) {
+export function resolveConfig(pluginOptions = {}) {
   const homeDir = os.homedir();
-  const configPath = path.join(homeDir, ".config", "opencode", "opencode.jsonc");
-  const configPathJson = path.join(homeDir, ".config", "opencode", "opencode.json");
-  const authPath = path.join(homeDir, ".local", "share", "opencode", "auth.json");
+  const configDir = process.env.XDG_CONFIG_HOME
+    ? path.join(process.env.XDG_CONFIG_HOME, "opencode")
+    : path.join(homeDir, ".config", "opencode");
+  const dataDir = process.env.XDG_DATA_HOME
+    ? path.join(process.env.XDG_DATA_HOME, "opencode")
+    : path.join(homeDir, ".local", "share", "opencode");
+
+  const configPath = path.join(configDir, "opencode.jsonc");
+  const configPathJson = path.join(configDir, "opencode.json");
+  const authPath = path.join(dataDir, "auth.json");
 
   const config = readJsonFile(configPath) || readJsonFile(configPathJson) || {};
   const auth = readJsonFile(authPath) || {};
@@ -184,7 +288,7 @@ function resolveConfig(pluginOptions = {}) {
   const googleProvider = config?.providers?.google || config?.provider?.google || {};
   const indorProvider = config?.providers?.indor || config?.provider?.indor || {};
 
-  const baseURL =
+  const rawBaseURL =
     pluginOptions.baseURL ||
     process.env.OPENCODE_GOOGLE_BASE_URL ||
     googleProvider?.settings?.baseURL ||
@@ -238,31 +342,67 @@ function resolveConfig(pluginOptions = {}) {
       : DEFAULT_CACHE_TTL_MS;
 
   return {
-    baseURL: baseURL.replace(/\/+$/, ""),
+    baseURL: normalizeBaseUrl(rawBaseURL),
     apiKey: (apiKey || "").trim(),
     model: normalizeModelId(model),
     fallbackModels,
     timeoutMs,
     requestTimeoutMs,
     cacheTtlMs,
+    keyInQuery: Boolean(pluginOptions.keyInQuery),
   };
 }
 
 /**
- * Safely escapes markdown square brackets in titles to prevent broken link syntax.
+ * Determines whether an HTTP error from a model endpoint is a global fatal authentication/account
+ * error (which should abort immediately) vs a model-specific failure (which should fall back).
  */
-function escapeMarkdown(str) {
-  if (!str) return "";
-  return str.replace(/\[/g, "\\[").replace(/\]/g, "\\]").replace(/\r?\n/g, " ").trim();
+export function isFatalClientError(statusCode, errorBody, rawText = "") {
+  if (statusCode === 401) return true;
+  if (statusCode !== 400 && statusCode !== 403) return false;
+
+  const detailsStr = JSON.stringify(errorBody?.error || {});
+  const combined = `${errorBody?.error?.message || ""} ${detailsStr} ${rawText}`;
+
+  // Global API key / credential / billing errors should halt immediately
+  return /api[_\s-]?key[_\s-]?(?:not[_\s-]?valid|invalid|expired|missing)|API_KEY_INVALID|unauthenticated|invalid[_\s-]?credentials|account[_\s-]?disabled|billing[_\s-]?not[_\s-]?enabled/i.test(
+    combined
+  );
 }
 
 /**
- * Extracts a clean hostname domain from a URL.
+ * Safely escapes markdown square brackets and whitespace in link titles.
+ */
+export function escapeMarkdown(str) {
+  if (!str) return "";
+  return str
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Escapes parentheses and spaces in URLs so Markdown link syntax [title](url) never breaks.
+ */
+export function escapeMarkdownUrl(uri) {
+  if (!uri) return "";
+  return uri
+    .trim()
+    .replace(/\(/g, "%28")
+    .replace(/\)/g, "%29")
+    .replace(/\s+/g, "%20");
+}
+
+/**
+ * Extracts a clean hostname domain from a URL, ignoring generic Google redirect domains.
  */
 function extractDomain(uri) {
   if (!uri) return "";
   try {
-    return new URL(uri).hostname.replace(/^www\./, "");
+    const hostname = new URL(uri).hostname.replace(/^www\./, "");
+    if (hostname === "vertexaisearch.cloud.google.com") return "";
+    return hostname;
   } catch {
     return "";
   }
@@ -271,7 +411,7 @@ function extractDomain(uri) {
 /**
  * Maps grounding supports to citation insertion markers based on remapped display indices.
  */
-function buildCitationInsertions(supports, remapTable) {
+export function buildCitationInsertions(supports, remapTable) {
   if (!supports || supports.length === 0 || !remapTable || remapTable.size === 0) return [];
 
   const mergedMap = new Map();
@@ -311,8 +451,9 @@ function buildCitationInsertions(supports, remapTable) {
 
 /**
  * Inserts citation markers into text at UTF-8 byte offsets.
+ * Aligns positions to valid UTF-8 code point boundaries and steps back before trailing newlines.
  */
-function insertMarkersByUtf8Index(text, insertions) {
+export function insertMarkersByUtf8Index(text, insertions) {
   if (!insertions || insertions.length === 0) return text;
   const encoder = new TextEncoder();
   const responseBytes = encoder.encode(text);
@@ -320,7 +461,21 @@ function insertMarkersByUtf8Index(text, insertions) {
   let lastIndex = responseBytes.length;
 
   for (const insertion of insertions) {
-    const position = Math.max(0, Math.min(insertion.index, lastIndex));
+    let position = Math.max(0, Math.min(insertion.index, lastIndex));
+
+    // Align position if it lands on a UTF-8 continuation byte (0b10xxxxxx)
+    while (position < lastIndex && (responseBytes[position] & 0xc0) === 0x80) {
+      position++;
+    }
+    while (position > 0 && position < responseBytes.length && (responseBytes[position] & 0xc0) === 0x80) {
+      position--;
+    }
+
+    // Step back before trailing CR/LF so markers never wrap onto the start of the next line
+    while (position > 0 && (responseBytes[position - 1] === 0x0a || responseBytes[position - 1] === 0x0d)) {
+      position--;
+    }
+
     parts.unshift(responseBytes.subarray(position, lastIndex));
     parts.unshift(encoder.encode(insertion.marker));
     lastIndex = position;
@@ -341,7 +496,7 @@ function insertMarkersByUtf8Index(text, insertions) {
  * Formats grounding output with citations, sources list, and search queries.
  * Returns both structured sources and a formatted markdown text with hyperlinks.
  */
-function formatOutput(rawText, metadata, maxSources = 8) {
+export function formatOutput(rawText, metadata, maxSources = 8) {
   let text = rawText || "";
   const chunks = metadata?.groundingChunks || [];
   const supports = metadata?.groundingSupports || [];
@@ -396,15 +551,16 @@ function formatOutput(rawText, metadata, maxSources = 8) {
       const displayIdx = remapTable.get(chunkIdx);
       const rawTitle = chunk.web?.title?.trim() || "";
       const uri = chunk.web?.uri?.trim() || "";
-      const fallbackTitle = extractDomain(uri) || "Source";
+      const fallbackTitle = extractDomain(uri) || `Source ${displayIdx}`;
       const title = rawTitle || fallbackTitle;
       const safeTitle = escapeMarkdown(title);
+      const safeUri = escapeMarkdownUrl(uri);
       structuredSources.push({
         index: displayIdx,
         title,
         uri,
       });
-      return uri ? `[${displayIdx}] [${safeTitle}](${uri})` : `[${displayIdx}] ${safeTitle}`;
+      return safeUri ? `[${displayIdx}] [${safeTitle}](${safeUri})` : `[${displayIdx}] ${safeTitle}`;
     });
     parts.push(`Sources:\n${sourceLines.join("\n")}`);
   }
@@ -426,72 +582,27 @@ function formatOutput(rawText, metadata, maxSources = 8) {
 }
 
 /**
- * Dispatches the generateContent call with googleSearch grounding enabled,
- * supporting dynamic model selection, per-request timeouts, automatic fallback,
- * context.progress reporting, and durable ctx.storage caching.
+ * Internal execution logic for Google Search grounding with fallback chain.
  */
-async function runGoogleGrounding(args, runContext = {}) {
-  const query = args.query?.trim();
-  if (!query) {
-    throw new Error("The 'query' parameter is required.");
-  }
-
-  // Discriminate runContext: supports either AbortSignal or context object
-  let signal;
-  let progress;
-  let storage;
-  let pluginOptions = {};
-
-  if (runContext && typeof runContext.addEventListener === "function") {
-    signal = runContext;
-  } else if (runContext && typeof runContext === "object") {
-    signal = runContext.signal;
-    progress = runContext.progress;
-    storage = runContext.storage;
-    pluginOptions = runContext.options || {};
-  }
-
-  const config = resolveConfig(pluginOptions);
-  if (!config.apiKey) {
-    throw new FatalError(
-      "Missing API key for Google grounding. Please configure it in opencode auth, opencode.jsonc plugin options, or set GOOGLE_API_KEY environment variable.",
-      401
-    );
-  }
-
-  const maxSources = Math.max(1, Math.min(Number(args.max_sources ?? 8), 20));
-
-  // --- Scheme 3: Cache lookup via ctx.storage ---
-  const cacheEnabled = config.cacheTtlMs > 0 && Boolean(storage && typeof storage.get === "function");
-  const cacheKey = cacheEnabled ? makeCacheKey(query, args.context) : null;
-
-  if (cacheEnabled && cacheKey) {
-    try {
-      const cached = await storage.get(cacheKey);
-      if (cached && typeof cached === "object" && cached.timestamp) {
-        if (Date.now() - cached.timestamp < config.cacheTtlMs) {
-          await reportProgress(progress, "Found cached Google search results");
-          return {
-            content: cached.content,
-            sources: cached.sources || [],
-            model: cached.model || config.model,
-            cached: true,
-          };
-        }
-      }
-    } catch {
-      // Storage read errors should not abort search
-    }
-  }
-
+async function executeGroundingWithFallback({
+  query,
+  context,
+  requestedModel,
+  maxSources,
+  config,
+  signal,
+  progress,
+  storage,
+  cacheEnabled,
+  cacheKey,
+}) {
+  const currentDate = new Date().toISOString().slice(0, 10);
   const prompt = [
     query,
-    args.context ? `\nAdditional context:\n${args.context}` : "",
-    "\nUse Google Search grounding to provide accurate, up-to-date information with source attribution.",
+    context ? `\nAdditional context:\n${context}` : "",
+    `\nCurrent date: ${currentDate}. Use Google Search grounding to provide accurate, up-to-date information with source attribution.`,
   ].join("");
 
-  // Build candidate model list with requested model first (if any), normalized and deduplicated
-  const requestedModel = normalizeModelId(args.model);
   const rawCandidates = requestedModel
     ? [requestedModel, config.model, ...config.fallbackModels]
     : [config.model, ...config.fallbackModels];
@@ -507,6 +618,10 @@ async function runGoogleGrounding(args, runContext = {}) {
     totalController.abort(signal?.reason || new Error("Operation cancelled by user"));
   };
   if (signal) {
+    if (signal.aborted) {
+      clearTimeout(totalTimer);
+      throw signal.reason || new Error("Operation cancelled by user");
+    }
     signal.addEventListener("abort", onExternalAbort, { once: true });
   }
 
@@ -534,7 +649,8 @@ async function runGoogleGrounding(args, runContext = {}) {
       };
       totalController.signal.addEventListener("abort", onTotalAbortForRequest, { once: true });
 
-      const url = `${config.baseURL}/models/${currentModel}:generateContent?key=${encodeURIComponent(config.apiKey)}`;
+      const querySuffix = config.keyInQuery ? `?key=${encodeURIComponent(config.apiKey)}` : "";
+      const url = `${config.baseURL}/models/${currentModel}:generateContent${querySuffix}`;
 
       try {
         const response = await fetch(url, {
@@ -566,8 +682,8 @@ async function runGoogleGrounding(args, runContext = {}) {
 
         const statusCode = response.status || body?.error?.code;
 
-        // Immediately abort on fatal, non-retryable authentication or client errors
-        if (statusCode === 400 || statusCode === 401 || statusCode === 403) {
+        // Halt immediately only on global authentication / invalid API key errors
+        if (isFatalClientError(statusCode, body, text)) {
           const msg = body?.error?.message || text;
           throw new FatalError(
             `Google grounding authentication/client error (${statusCode}) on model '${currentModel}': ${msg}`,
@@ -624,7 +740,7 @@ async function runGoogleGrounding(args, runContext = {}) {
       } catch (err) {
         lastError = err;
 
-        // Propagate fatal errors and external/overall cancellations immediately
+        // Propagate fatal auth errors and external/overall cancellations immediately
         if (err instanceof FatalError) {
           throw err;
         }
@@ -632,7 +748,7 @@ async function runGoogleGrounding(args, runContext = {}) {
           throw totalController.signal.reason || err;
         }
 
-        // For retryable errors (429, 404, 5xx) or per-model timeouts, inform progress and continue
+        // For retryable or model-specific errors (429, 400 unsupported model, 404, 5xx) or timeouts, fall back
         const nextModel = uniqueCandidates[i + 1];
         if (nextModel) {
           await reportProgress(
@@ -653,6 +769,96 @@ async function runGoogleGrounding(args, runContext = {}) {
       signal.removeEventListener("abort", onExternalAbort);
     }
   }
+}
+
+/**
+ * Dispatches the generateContent call with googleSearch grounding enabled,
+ * supporting dynamic model selection, per-request timeouts, automatic fallback,
+ * context.progress reporting, in-flight deduplication, and durable ctx.storage caching.
+ */
+export async function runGoogleGrounding(args, runContext = {}) {
+  const query = args?.query?.trim();
+  if (!query) {
+    throw new Error("The 'query' parameter is required.");
+  }
+
+  // Discriminate runContext: supports either AbortSignal or context object
+  let signal;
+  let progress;
+  let storage;
+  let pluginOptions = {};
+
+  if (runContext && typeof runContext.addEventListener === "function") {
+    signal = runContext;
+  } else if (runContext && typeof runContext === "object") {
+    signal = runContext.signal;
+    progress = runContext.progress;
+    storage = runContext.storage;
+    pluginOptions = runContext.options || {};
+  }
+
+  const config = resolveConfig(pluginOptions);
+  if (!config.apiKey) {
+    throw new FatalError(
+      "Missing API key for Google grounding. Please configure it in opencode auth, opencode.jsonc plugin options, or set GOOGLE_API_KEY environment variable.",
+      401
+    );
+  }
+
+  const maxSources = Math.max(1, Math.min(Number(args.max_sources ?? 8), 20));
+  const requestedModel = normalizeModelId(args.model);
+  const effectivePrimaryModel = requestedModel || config.model;
+  const dedupeKey = makeCacheKey(query, args.context, effectivePrimaryModel, maxSources);
+
+  // --- Cache lookup via ctx.storage ---
+  const cacheEnabled = config.cacheTtlMs > 0 && Boolean(storage && typeof storage.get === "function");
+  const cacheKey = cacheEnabled ? dedupeKey : null;
+
+  if (cacheEnabled && cacheKey) {
+    try {
+      const cached = await storage.get(cacheKey);
+      if (cached && typeof cached === "object" && cached.timestamp) {
+        if (Date.now() - cached.timestamp < config.cacheTtlMs) {
+          await reportProgress(progress, "Found cached Google search results");
+          return {
+            content: cached.content,
+            sources: cached.sources || [],
+            model: cached.model || effectivePrimaryModel,
+            cached: true,
+          };
+        }
+      }
+    } catch {
+      // Storage read errors should not abort search
+    }
+  }
+
+  // --- Singleflight in-flight deduplication for concurrent identical queries ---
+  if (!signal && inFlightRequests.has(dedupeKey)) {
+    return inFlightRequests.get(dedupeKey);
+  }
+
+  const executionPromise = executeGroundingWithFallback({
+    query,
+    context: args.context,
+    requestedModel,
+    maxSources,
+    config,
+    signal,
+    progress,
+    storage,
+    cacheEnabled,
+    cacheKey,
+  });
+
+  if (!signal) {
+    inFlightRequests.set(dedupeKey, executionPromise);
+    executionPromise.finally(() => {
+      inFlightRequests.delete(dedupeKey);
+    }).catch(() => {});
+  }
+
+  return executionPromise;
 }
 
 export default {
@@ -728,11 +934,17 @@ export default {
           ...toolDef,
         });
 
-        // Also register websearch_cited as an alias so prompts expecting either name work
-        tools.add({
-          name: "websearch_cited",
-          ...toolDef,
-        });
+        // Register legacy 'websearch_cited' alias only when explicitly enabled to save prompt tokens
+        const enableLegacyAlias =
+          Boolean(pluginOptions.enableLegacyAlias) ||
+          process.env.OPENCODE_GOOGLE_LEGACY_ALIAS === "true";
+
+        if (enableLegacyAlias) {
+          tools.add({
+            name: "websearch_cited",
+            ...toolDef,
+          });
+        }
       });
     }
 

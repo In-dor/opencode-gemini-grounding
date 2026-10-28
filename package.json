@@ -1,11 +1,14 @@
 {
   "name": "opencode-gemini-grounding",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "OpenCode V2 plugin for Gemini Google Search Grounding with academic-style inline citations, sources list, dynamic model selection, and automatic fallback chain.",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js"
+  },
+  "scripts": {
+    "test": "node --test test/index.test.js"
   },
   "files": [
     "index.js",
