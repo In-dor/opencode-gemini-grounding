@@ -9,27 +9,39 @@ const require = createRequire(import.meta.url);
 const DEFAULT_MODEL = "gemini-4-hydrogen";
 const DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 
-// Per-model request timeout (60s), overall fallback chain timeout (180s / 3 minutes), and cache TTL (10m)
-const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
-const DEFAULT_TOTAL_TIMEOUT_MS = 180000;
+// Per-model request timeout (180s / 3m), overall fallback chain timeout (360s / 6m),
+// fast fallback model timeout cap (60s), reserved fast-fallback budget (45s), and cache TTL (10m)
+const DEFAULT_REQUEST_TIMEOUT_MS = 180000;
+const DEFAULT_TOTAL_TIMEOUT_MS = 360000;
+const DEFAULT_FAST_MODEL_TIMEOUT_MS = 60000;
+const RESERVED_FAST_FALLBACK_BUDGET_MS = 45000;
 const DEFAULT_CACHE_TTL_MS = 600000;
+const DEFAULT_MAX_CACHE_ENTRIES = 200;
+const CACHE_SWEEP_WRITE_INTERVAL = 20;
 const MAX_SNIPPET_LENGTH = 280;
 
-// Default fallback chain when the primary model fails or encounters rate limits
+// Default fallback chain when the primary model fails, times out, or encounters rate limits
 const DEFAULT_FALLBACK_MODELS = [
   "gemini-4-hydrogen",
+  "gemini-4-neon",
   "gemini-3.8-flash",
   "gemini-3.5-flash-lite",
-  "gemini-3.7-flash",
-  "gemini-3.1-flash-lite",
   "gemini-3-flash-preview",
   "gemini-2.5-flash",
 ];
 
-const VALID_THINKING_LEVELS = new Set(["LOW", "MEDIUM", "HIGH", "XHIGH"]);
+const VALID_THINKING_LEVELS = new Set(["MINIMAL", "LOW", "MEDIUM", "HIGH", "XHIGH"]);
 const VALID_AUTH_MODES = new Set(["auto", "x-goog-api-key", "bearer", "both"]);
+const BLOCKED_FINISH_REASONS = new Set([
+  "SAFETY",
+  "RECITATION",
+  "PROHIBITED_CONTENT",
+  "BLOCKLIST",
+  "SPII",
+  "IMAGE_SAFETY",
+]);
 
-// In-memory file cache keyed by filePath -> { mtimeMs, data }
+// In-memory file cache keyed by filePath -> { mtimeMs, size, data }
 const jsonFileCache = new Map();
 
 // In-memory SQLite credential cache keyed by `${dbPath}::${integrationId}` -> { stamp, data }
@@ -37,6 +49,10 @@ const sqliteCredentialCache = new Map();
 
 // In-flight request deduplication map keyed by cacheKey -> subscriber-managed entry
 const inFlightRequests = new Map();
+
+// Tracks active storage cache sweeps to prevent overlapping scans on the same storage instance
+const activeCacheSweeps = new WeakSet();
+let cacheWriteCounter = 0;
 
 let cachedSqliteLoader;
 
@@ -205,23 +221,183 @@ export function buildRequestHeaders(config) {
 
 /**
  * Computes a collision-resistant SHA-256 cache key across query, context, model, maxSources,
- * and (when non-default) baseURL.
+ * (when non-default) baseURL, and (when explicitly set) thinkingLevel.
  */
-export function makeCacheKey(query, context = "", model = "", maxSources = 8, baseURL = "") {
+export function makeCacheKey(query, context = "", model = "", maxSources = 8, baseURL = "", thinkingLevel = "") {
   const normQuery = String(query || "").trim().toLowerCase();
   const normContext = String(context || "").trim().toLowerCase();
   const normModel = normalizeModelId(model).toLowerCase();
   const parsedMax = Number(maxSources);
-  const normMax = Number.isFinite(parsedMax) && parsedMax > 0 ? parsedMax : 8;
+  const normMax = Number.isFinite(parsedMax) ? Math.max(1, Math.min(Math.floor(parsedMax), 20)) : 8;
   const normBase = baseURL ? normalizeBaseUrl(baseURL).toLowerCase() : "";
   const isDefaultBase = !normBase || normBase === DEFAULT_GEMINI_BASE_URL.toLowerCase();
+  const normThinking = typeof thinkingLevel === "string" ? thinkingLevel.trim().toUpperCase() : "";
+  const validThinking = VALID_THINKING_LEVELS.has(normThinking) ? normThinking : "";
 
-  const payload = isDefaultBase
-    ? JSON.stringify([normQuery, normContext, normModel, normMax])
-    : JSON.stringify([normQuery, normContext, normModel, normMax, normBase]);
+  let payload;
+  if (!validThinking) {
+    payload = isDefaultBase
+      ? JSON.stringify([normQuery, normContext, normModel, normMax])
+      : JSON.stringify([normQuery, normContext, normModel, normMax, normBase]);
+  } else {
+    payload = JSON.stringify([
+      normQuery,
+      normContext,
+      normModel,
+      normMax,
+      isDefaultBase ? "" : normBase,
+      validThinking,
+    ]);
+  }
 
   const hash = crypto.createHash("sha256").update(payload).digest("hex").slice(0, 32);
   return `cache:v2:grounding:${hash}`;
+}
+
+/**
+ * Returns true if a model ID belongs to a high-speed Flash / Flash-Lite tier.
+ */
+export function isFastFallbackModel(modelId) {
+  const clean = normalizeModelId(modelId);
+  return Boolean(clean && /(?:flash|lite)/i.test(clean));
+}
+
+/**
+ * Resolves and clamps an explicit thinkingLevel against the target Gemini model's supported levels.
+ * Returns undefined when thinkingLevel is not configured or when targeting pre-Gemini-3 models.
+ */
+export function resolveModelThinkingLevel(thinkingLevel, modelId) {
+  if (typeof thinkingLevel !== "string") return undefined;
+  const upper = thinkingLevel.trim().toUpperCase();
+  if (!VALID_THINKING_LEVELS.has(upper)) return undefined;
+
+  const cleanModel = normalizeModelId(modelId);
+  if (!/^gemini-[34]/i.test(cleanModel)) {
+    return undefined;
+  }
+
+  if (upper === "XHIGH") {
+    // Only Gemini 4 flagship tiers (hydrogen, neon, carbon) accept XHIGH; clamp others to HIGH
+    return /^gemini-4-(?:hydrogen|neon|carbon)(?:$|[-])/i.test(cleanModel) ? "XHIGH" : "HIGH";
+  }
+
+  if (upper === "MINIMAL") {
+    // Only Flash-Lite / Flash models accept MINIMAL; clamp reasoning/flagship models to LOW
+    return /flash/i.test(cleanModel) ? "MINIMAL" : "LOW";
+  }
+
+  return upper;
+}
+
+/**
+ * Computes per-attempt timeout while capping fallback Flash/Lite models and reserving budget
+ * so heavyweight flagship models cannot starve downstream fast fallback models.
+ */
+export function computeAttemptTimeoutMs({
+  currentModel,
+  candidateIndex,
+  uniqueCandidates,
+  config,
+  remainingTotalMs,
+}) {
+  if (!Number.isFinite(remainingTotalMs) || remainingTotalMs <= 0) {
+    return 0;
+  }
+
+  const isFallbackAttempt = candidateIndex > 0;
+  const currentIsFast = isFastFallbackModel(currentModel);
+  const modelCap =
+    isFallbackAttempt && currentIsFast
+      ? Math.min(config.requestTimeoutMs, DEFAULT_FAST_MODEL_TIMEOUT_MS)
+      : config.requestTimeoutMs;
+
+  const trailingModels = Array.isArray(uniqueCandidates) ? uniqueCandidates.slice(candidateIndex + 1) : [];
+  const hasFastFallbackAhead = trailingModels.some(isFastFallbackModel);
+
+  if (!hasFastFallbackAhead) {
+    return Math.max(1, Math.min(modelCap, remainingTotalMs));
+  }
+
+  let reserveMs = 0;
+  if (!currentIsFast) {
+    // Reserve up to 45s (scaled down proportionally if total timeoutMs is small) for trailing fast models
+    reserveMs = Math.min(RESERVED_FAST_FALLBACK_BUDGET_MS, Math.floor(config.timeoutMs * 0.2));
+  } else {
+    // When multiple fast models remain (e.g. 3.8-flash -> 3.5-flash-lite), reserve a slice for the next fast model
+    reserveMs = Math.min(15000, Math.floor(remainingTotalMs * 0.35));
+  }
+
+  const availableMs = Math.max(1, remainingTotalMs - reserveMs);
+  return Math.max(1, Math.min(modelCap, availableMs));
+}
+
+/**
+ * Scans `ctx.storage` under `cache:` prefix and removes expired entries as well as oldest entries
+ * exceeding `maxEntries`, preventing unbounded growth in `opencode.db` `kv` table.
+ */
+export async function pruneStorageCache(
+  storage,
+  cacheTtlMs = DEFAULT_CACHE_TTL_MS,
+  maxEntries = DEFAULT_MAX_CACHE_ENTRIES
+) {
+  if (!storage || typeof storage.scan !== "function" || typeof storage.remove !== "function") {
+    return 0;
+  }
+  if (activeCacheSweeps.has(storage)) {
+    return 0;
+  }
+
+  activeCacheSweeps.add(storage);
+  try {
+    const now = Date.now();
+    const expiredKeys = [];
+    const validEntries = [];
+    let after;
+    const maxPages = 20;
+
+    for (let pageIdx = 0; pageIdx < maxPages; pageIdx++) {
+      const scanOpts = after ? { prefix: "cache:", after, limit: 100 } : { prefix: "cache:", limit: 100 };
+      const page = await storage.scan(scanOpts);
+      const entries = Array.isArray(page?.entries) ? page.entries : [];
+      if (entries.length === 0) break;
+
+      for (const item of entries) {
+        const key = item?.key;
+        if (typeof key !== "string" || !key.startsWith("cache:")) continue;
+        const val = item?.value;
+        const ts = val && typeof val === "object" ? val.timestamp : undefined;
+
+        if (typeof ts !== "number" || !Number.isFinite(ts) || cacheTtlMs <= 0 || now - ts >= cacheTtlMs) {
+          expiredKeys.push(key);
+        } else {
+          validEntries.push({ key, timestamp: ts });
+        }
+      }
+
+      if (!page?.next) break;
+      after = page.next;
+    }
+
+    if (maxEntries > 0 && validEntries.length > maxEntries) {
+      validEntries.sort((a, b) => a.timestamp - b.timestamp);
+      const overflowCount = validEntries.length - maxEntries;
+      for (let i = 0; i < overflowCount; i++) {
+        expiredKeys.push(validEntries[i].key);
+      }
+    }
+
+    const batchSize = 25;
+    for (let i = 0; i < expiredKeys.length; i += batchSize) {
+      const batch = expiredKeys.slice(i, i + batchSize);
+      await Promise.allSettled(batch.map((k) => Promise.resolve(storage.remove(k))));
+    }
+
+    return expiredKeys.length;
+  } catch {
+    return 0;
+  } finally {
+    activeCacheSweeps.delete(storage);
+  }
 }
 
 /**
@@ -261,7 +437,7 @@ export function extractSnippetForSource(displayIndex, text) {
       // Split into sentences while keeping citation markers [i] and punctuation grouped together
       const sentences = cleanLine
         .split(
-          /(?<=[。！？!?])(?![\d\[\]])\s*|(?<=(?:\[\d+\])+)(?![\d\[\]。！？.!?])\s*|(?<=\.)(?=\s+[A-Z\u4e00-\u9fa5])\s*/g
+          /(?<=[。！？!?])(?![\d\[\]])\s*|(?<=(?:\[\d+\])+)(?![\d\[\]。！？.!?])\s*|(?<=\.)(?=\s+(?:[*_`"'“‘(\[]*[A-Z0-9\u4e00-\u9fa5]))\s*/g
         )
         .map((s) => s.trim())
         .filter(Boolean);
@@ -376,14 +552,14 @@ function readJsonFile(filePath) {
   try {
     const stat = fs.statSync(filePath);
     const cached = jsonFileCache.get(filePath);
-    if (cached && cached.mtimeMs === stat.mtimeMs) {
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
       return cached.data;
     }
 
     const content = fs.readFileSync(filePath, "utf-8");
     const clean = stripJsonComments(content);
     const data = JSON.parse(clean);
-    jsonFileCache.set(filePath, { mtimeMs: stat.mtimeMs, data });
+    jsonFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, data });
     return data;
   } catch {
     jsonFileCache.delete(filePath);
@@ -528,7 +704,7 @@ export function readCredentialFromSqlite(integrationId, dbPath) {
         : new driver.Ctor(resolvedDbPath, { readonly: true });
 
     const stmt = db.prepare(
-      "SELECT integration_id, value, active, time_created, id FROM credential WHERE integration_id = ? ORDER BY COALESCE(active, 0) DESC, active DESC, time_created DESC, id DESC LIMIT 1"
+      "SELECT integration_id, value, active, time_created, id FROM credential WHERE integration_id = ? ORDER BY CASE WHEN active = 1 THEN 2 WHEN active IS NULL THEN 1 ELSE 0 END DESC, time_created DESC, id DESC LIMIT 1"
     );
 
     let firstMatch = null;
@@ -694,6 +870,16 @@ function resolveNonNegativeNumber(val, fallback) {
   return Number.isFinite(num) && num >= 0 ? num : fallback;
 }
 
+function resolveBoolean(val, fallback) {
+  if (typeof val === "boolean") return val;
+  if (typeof val === "string") {
+    const norm = val.trim().toLowerCase();
+    if (norm === "true" || norm === "1" || norm === "yes") return true;
+    if (norm === "false" || norm === "0" || norm === "no") return false;
+  }
+  return fallback;
+}
+
 function normalizeThinkingLevel(val) {
   if (typeof val !== "string") return undefined;
   const upper = val.trim().toUpperCase();
@@ -707,7 +893,7 @@ function normalizeAuthMode(val) {
 }
 
 function parseFallbackModelsOption(pluginOptions) {
-  if (Array.isArray(pluginOptions?.fallbackModels) && pluginOptions.fallbackModels.length > 0) {
+  if (Array.isArray(pluginOptions?.fallbackModels)) {
     return pluginOptions.fallbackModels;
   }
   if (typeof pluginOptions?.fallbackModels === "string" && pluginOptions.fallbackModels.trim()) {
@@ -838,6 +1024,7 @@ function buildFinalConfig(pluginOptions = {}, sources = {}) {
     pluginOptions.thinkingLevel || process.env.OPENCODE_GOOGLE_THINKING_LEVEL
   );
   const authMode = normalizeAuthMode(pluginOptions.authMode || process.env.OPENCODE_GOOGLE_AUTH_MODE);
+  const streaming = resolveBoolean(pluginOptions.streaming ?? process.env.OPENCODE_GOOGLE_STREAMING, true);
 
   return {
     baseURL: normalizeBaseUrl(rawBaseURL, baseDir),
@@ -851,11 +1038,12 @@ function buildFinalConfig(pluginOptions = {}, sources = {}) {
     timeoutMs,
     requestTimeoutMs,
     cacheTtlMs,
+    streaming,
     keyInQuery: Boolean(pluginOptions.keyInQuery),
   };
 }
 
-function resolveDiskSourcesSync(pluginOptions = {}, runtimeOptions = {}) {
+function resolveDiskSourcesSync(pluginOptions = {}, runtimeOptions = {}, { skipSqlite = false } = {}) {
   const { configDir, dataDir } = getDefaultOpenCodeDirs();
   const directory = runtimeOptions.directory || pluginOptions.directory || process.cwd();
   const dbPath = runtimeOptions.dbPath || pluginOptions.dbPath || path.join(dataDir, "opencode.db");
@@ -880,24 +1068,31 @@ function resolveDiskSourcesSync(pluginOptions = {}, runtimeOptions = {}) {
     return merged;
   };
 
+  const customProviderName =
+    typeof pluginOptions.providerId === "string" &&
+    pluginOptions.providerId.trim() &&
+    pluginOptions.providerId.trim() !== "google" &&
+    pluginOptions.providerId.trim() !== "indor"
+      ? pluginOptions.providerId.trim()
+      : "";
+
   const googleProvider = mergeProviderDocs("google");
   const indorProvider = mergeProviderDocs("indor");
-  const customProvider =
-    pluginOptions.providerId && pluginOptions.providerId !== "google" && pluginOptions.providerId !== "indor"
-      ? mergeProviderDocs(pluginOptions.providerId)
-      : {};
+  const customProvider = customProviderName ? mergeProviderDocs(customProviderName) : {};
 
   const primaryIds = Array.from(
     new Set(["google-grounding", pluginOptions.integrationId].filter((id) => typeof id === "string" && id.trim()))
   );
   const secondaryIds = Array.from(
     new Set(
-      [googleProvider.integrationID, "google", "indor"].filter((id) => typeof id === "string" && id.trim())
+      [customProvider.integrationID, googleProvider.integrationID, indorProvider.integrationID, "google", "indor"].filter(
+        (id) => typeof id === "string" && id.trim()
+      )
     )
   );
 
-  const primaryCredential = readCredentialFromSqlite(primaryIds, dbPath);
-  const secondaryCredential = readCredentialFromSqlite(secondaryIds, dbPath);
+  const primaryCredential = skipSqlite ? null : readCredentialFromSqlite(primaryIds, dbPath);
+  const secondaryCredential = skipSqlite ? null : readCredentialFromSqlite(secondaryIds, dbPath);
   const authEntry = resolveAuthJsonEntry(
     auth,
     [...primaryIds, ...secondaryIds],
@@ -908,6 +1103,7 @@ function resolveDiskSourcesSync(pluginOptions = {}, runtimeOptions = {}) {
     baseDir: directory,
     dbPath,
     authPath,
+    customProviderName,
     primaryIds,
     secondaryIds,
     googleProvider,
@@ -976,74 +1172,124 @@ async function resolveFromIntegrationApi(integrationApi, integrationIds, baseDir
 
 /**
  * Asynchronously resolves connection settings, enriching synchronous disk/env resolution
- * with live OpenCode V2 plugin runtime APIs (`ctx.integration`, `ctx.provider`, `ctx.config`).
+ * with parallel OpenCode V2 runtime API queries (`ctx.integration`, `ctx.provider`, `ctx.config`)
+ * and deferring SQLite `opencode.db` reads until needed.
  */
 async function resolveConfigAsync(pluginOptions = {}, runtimeContext = {}) {
-  const disk = resolveDiskSourcesSync(pluginOptions, runtimeContext);
+  const hasIntegrationRuntime = Boolean(runtimeContext.integration?.connection);
+  const disk = resolveDiskSourcesSync(pluginOptions, runtimeContext, { skipSqlite: hasIntegrationRuntime });
   const directory = disk.baseDir;
 
-  // Query live ctx.config if available
-  if (typeof runtimeContext.configApi?.get === "function") {
-    try {
-      const cfgRes = await runtimeContext.configApi.get();
-      const cfgData = cfgRes?.data || cfgRes;
-      if (cfgData && typeof cfgData === "object") {
-        const gObj = cfgData?.providers?.google || cfgData?.provider?.google;
-        if (gObj) {
-          const extracted = extractProviderFields(gObj, directory);
-          if (extracted.baseURL) disk.googleProvider.baseURL = extracted.baseURL;
-          if (extracted.apiKey) disk.googleProvider.apiKey = extracted.apiKey;
-          if (extracted.model) disk.googleProvider.model = extracted.model;
-          if (extracted.integrationID) disk.googleProvider.integrationID = extracted.integrationID;
-          Object.assign(disk.googleProvider.headers, extracted.headers);
-        }
+  const applyExtractedToTarget = (target, extracted, prependSecondary = false) => {
+    if (!target || !extracted) return;
+    if (extracted.baseURL) target.baseURL = extracted.baseURL;
+    if (extracted.apiKey) target.apiKey = extracted.apiKey;
+    if (extracted.model) target.model = extracted.model;
+    if (extracted.integrationID) {
+      target.integrationID = extracted.integrationID;
+      if (prependSecondary && !disk.secondaryIds.includes(extracted.integrationID)) {
+        disk.secondaryIds.unshift(extracted.integrationID);
       }
+    }
+    if (extracted.headers) {
+      Object.assign(target.headers, extracted.headers);
+    }
+  };
+
+  const fetchProviderSafe = async (providerID) => {
+    if (!providerID || typeof runtimeContext.provider?.get !== "function") return null;
+    try {
+      const res = await runtimeContext.provider.get({ providerID });
+      return res?.data || res || null;
     } catch {
-      // Ignore config API errors
+      return null;
+    }
+  };
+
+  const fetchConfigSafe = async () => {
+    if (typeof runtimeContext.configApi?.get !== "function") return null;
+    try {
+      const res = await runtimeContext.configApi.get();
+      return res?.data || res || null;
+    } catch {
+      return null;
+    }
+  };
+
+  const [cfgSettled, googleProvSettled, indorProvSettled, customProvSettled, primaryCredSettled] =
+    await Promise.allSettled([
+      fetchConfigSafe(),
+      fetchProviderSafe("google"),
+      fetchProviderSafe("indor"),
+      disk.customProviderName ? fetchProviderSafe(disk.customProviderName) : Promise.resolve(null),
+      hasIntegrationRuntime
+        ? resolveFromIntegrationApi(runtimeContext.integration, disk.primaryIds, directory)
+        : Promise.resolve(null),
+    ]);
+
+  const cfgData = cfgSettled.status === "fulfilled" ? cfgSettled.value : null;
+  if (cfgData && typeof cfgData === "object") {
+    const gObj = cfgData?.providers?.google || cfgData?.provider?.google;
+    if (gObj) applyExtractedToTarget(disk.googleProvider, extractProviderFields(gObj, directory), true);
+
+    const iObj = cfgData?.providers?.indor || cfgData?.provider?.indor;
+    if (iObj) applyExtractedToTarget(disk.indorProvider, extractProviderFields(iObj, directory), true);
+
+    if (disk.customProviderName) {
+      const cObj = cfgData?.providers?.[disk.customProviderName] || cfgData?.provider?.[disk.customProviderName];
+      if (cObj) {
+        disk.customProvider.headers ??= {};
+        applyExtractedToTarget(disk.customProvider, extractProviderFields(cObj, directory), true);
+      }
     }
   }
 
-  // Query live ctx.provider.get({ providerID: "google" }) if available
-  if (typeof runtimeContext.provider?.get === "function") {
-    try {
-      const provRes = await runtimeContext.provider.get({ providerID: "google" });
-      const provData = provRes?.data || provRes;
-      if (provData && typeof provData === "object") {
-        const extracted = extractProviderFields(provData, directory);
-        if (extracted.baseURL) disk.googleProvider.baseURL = extracted.baseURL;
-        if (extracted.apiKey) disk.googleProvider.apiKey = extracted.apiKey;
-        if (extracted.model) disk.googleProvider.model = extracted.model;
-        if (extracted.integrationID) {
-          disk.googleProvider.integrationID = extracted.integrationID;
-          if (!disk.secondaryIds.includes(extracted.integrationID)) {
-            disk.secondaryIds.unshift(extracted.integrationID);
-          }
-        }
-        Object.assign(disk.googleProvider.headers, extracted.headers);
-      }
-    } catch {
-      // Ignore provider API errors (e.g. ProviderNotFoundError)
-    }
+  const googleProvData = googleProvSettled.status === "fulfilled" ? googleProvSettled.value : null;
+  if (googleProvData && typeof googleProvData === "object") {
+    applyExtractedToTarget(disk.googleProvider, extractProviderFields(googleProvData, directory), true);
   }
 
-  // Query live ctx.integration.connection.active + resolve if available
-  if (runtimeContext.integration?.connection) {
-    const primaryRuntimeCred = await resolveFromIntegrationApi(
-      runtimeContext.integration,
-      disk.primaryIds,
-      directory
-    );
+  const indorProvData = indorProvSettled.status === "fulfilled" ? indorProvSettled.value : null;
+  if (indorProvData && typeof indorProvData === "object") {
+    applyExtractedToTarget(disk.indorProvider, extractProviderFields(indorProvData, directory), true);
+  }
+
+  const customProvData = customProvSettled.status === "fulfilled" ? customProvSettled.value : null;
+  if (customProvData && typeof customProvData === "object") {
+    disk.customProvider.headers ??= {};
+    applyExtractedToTarget(disk.customProvider, extractProviderFields(customProvData, directory), true);
+  }
+
+  if (hasIntegrationRuntime) {
+    const primaryRuntimeCred = primaryCredSettled.status === "fulfilled" ? primaryCredSettled.value : null;
     if (primaryRuntimeCred) {
       disk.primaryCredential = primaryRuntimeCred;
     }
 
-    const secondaryRuntimeCred = await resolveFromIntegrationApi(
-      runtimeContext.integration,
-      disk.secondaryIds,
-      directory
+    const primaryComplete = Boolean(
+      disk.primaryCredential?.apiKey && disk.primaryCredential?.baseURL && disk.primaryCredential?.model
     );
-    if (secondaryRuntimeCred) {
-      disk.secondaryCredential = secondaryRuntimeCred;
+
+    if (!primaryComplete) {
+      const secondaryRuntimeCred = await resolveFromIntegrationApi(
+        runtimeContext.integration,
+        disk.secondaryIds,
+        directory
+      );
+      if (secondaryRuntimeCred) {
+        disk.secondaryCredential = secondaryRuntimeCred;
+      }
+    }
+
+    // Lazily read opencode.db only when runtime integration APIs did not resolve credentials
+    if (!disk.primaryCredential) {
+      disk.primaryCredential = readCredentialFromSqlite(disk.primaryIds, disk.dbPath);
+    }
+    if (
+      !disk.secondaryCredential &&
+      (!disk.primaryCredential?.apiKey || !disk.primaryCredential?.baseURL || !disk.primaryCredential?.model)
+    ) {
+      disk.secondaryCredential = readCredentialFromSqlite(disk.secondaryIds, disk.dbPath);
     }
   }
 
@@ -1075,17 +1321,28 @@ export function isFatalClientError(statusCode, errorBody, rawText = "") {
   const combined = `${errorBody?.error?.message || ""} ${detailsStr} ${rawText}`;
 
   // Global API key / credential / billing errors should halt immediately
-  return /api[_\s-]?key[_\s-]?(?:not[_\s-]?valid|invalid|expired|missing)|API_KEY_INVALID|unauthenticated|invalid[_\s-]?credentials|account[_\s-]?disabled|billing[_\s-]?not[_\s-]?enabled/i.test(
-    combined
-  );
+  if (
+    /api[_\s-]?key[_\s-]?(?:not[_\s-]?valid|invalid|expired|missing)|API_KEY_INVALID|unauthenticated|invalid[_\s-]?credentials|account[_\s-]?disabled|billing[_\s-]?not[_\s-]?enabled|invalid[_\s-]?api[_\s-]?token|无效的令牌|令牌已过期/i.test(
+      combined
+    )
+  ) {
+    return true;
+  }
+
+  if (statusCode === 403 && /token[_\s-]?(?:expired|invalid|revoked)/i.test(combined)) {
+    return true;
+  }
+
+  return false;
 }
 
 /**
- * Safely escapes markdown square brackets and whitespace in link titles.
+ * Safely escapes backslashes, markdown square brackets, and whitespace in link titles.
  */
 export function escapeMarkdown(str) {
   if (!str) return "";
   return str
+    .replace(/\\/g, "\\\\")
     .replace(/\[/g, "\\[")
     .replace(/\]/g, "\\]")
     .replace(/\s+/g, " ")
@@ -1221,8 +1478,8 @@ export function insertMarkersByUtf8Index(text, insertions) {
 }
 
 /**
- * Formats grounding output with citations, sources list, and search queries.
- * Returns both structured sources and a formatted markdown text with hyperlinks.
+ * Formats grounding output with citations, deduplicated sources list, and search queries.
+ * Deduplicates chunks sharing the same URI and prioritizes heavily cited sources when capping to maxSources.
  */
 export function formatOutput(rawText, metadata, maxSources = 8) {
   let text = rawText || "";
@@ -1231,37 +1488,118 @@ export function formatOutput(rawText, metadata, maxSources = 8) {
   const parsedMax = Number(maxSources);
   const safeMaxSources = Number.isFinite(parsedMax) ? Math.max(1, Math.min(Math.floor(parsedMax), 20)) : 8;
 
-  // Identify all chunk indices cited in supports
-  const citedIndicesSet = new Set();
+  // Count how many support segments cite each valid chunk index
+  const citationCounts = new Map();
   for (const support of supports) {
     const indices = support?.groundingChunkIndices;
     if (indices && Array.isArray(indices)) {
+      const seenInSegment = new Set();
       for (const idx of indices) {
-        if (typeof idx === "number" && idx >= 0 && idx < chunks.length) {
-          citedIndicesSet.add(idx);
+        if (typeof idx === "number" && idx >= 0 && idx < chunks.length && !seenInSegment.has(idx)) {
+          seenInSegment.add(idx);
+          citationCounts.set(idx, (citationCounts.get(idx) || 0) + 1);
         }
       }
     }
   }
 
-  let selectedChunkIndices = [];
+  let selectedGroups = [];
   const remapTable = new Map(); // originalChunkIndex -> displayIndex (1-based)
 
-  if (citedIndicesSet.size > 0) {
-    // Sort cited indices in ascending order and cap to safeMaxSources
-    selectedChunkIndices = Array.from(citedIndicesSet)
-      .sort((a, b) => a - b)
-      .slice(0, safeMaxSources);
-    selectedChunkIndices.forEach((chunkIdx, i) => {
-      remapTable.set(chunkIdx, i + 1);
+  if (citationCounts.size > 0) {
+    // Group cited chunks by non-empty URI so duplicate search hits share a single source slot
+    const sortedCitedIndices = Array.from(citationCounts.keys()).sort((a, b) => a - b);
+    const groupsByUri = new Map();
+    const citedGroups = [];
+
+    for (const rawIdx of sortedCitedIndices) {
+      const chunk = chunks[rawIdx];
+      const uri = chunk?.web?.uri?.trim() || "";
+      const rawTitle = chunk?.web?.title?.trim() || "";
+      const count = citationCounts.get(rawIdx) || 0;
+
+      if (uri && groupsByUri.has(uri)) {
+        const existing = groupsByUri.get(uri);
+        existing.rawIndices.push(rawIdx);
+        existing.citeCount += count;
+        if (!existing.title && rawTitle) {
+          existing.title = rawTitle;
+          existing.repChunkIdx = rawIdx;
+        }
+      } else {
+        const group = {
+          repChunkIdx: rawIdx,
+          firstChunkIdx: rawIdx,
+          rawIndices: [rawIdx],
+          citeCount: count,
+          title: rawTitle,
+          uri,
+        };
+        if (uri) {
+          groupsByUri.set(uri, group);
+        }
+        citedGroups.push(group);
+      }
+    }
+
+    // When unique cited sources exceed safeMaxSources, keep the most frequently cited ones,
+    // then restore ascending chunk appearance order for clean [1], [2], ... numbering
+    if (citedGroups.length > safeMaxSources) {
+      selectedGroups = citedGroups
+        .slice()
+        .sort((a, b) => b.citeCount - a.citeCount || a.firstChunkIdx - b.firstChunkIdx)
+        .slice(0, safeMaxSources)
+        .sort((a, b) => a.firstChunkIdx - b.firstChunkIdx);
+    } else {
+      selectedGroups = citedGroups;
+    }
+
+    selectedGroups.forEach((group, i) => {
+      const displayIdx = i + 1;
+      for (const rawIdx of group.rawIndices) {
+        remapTable.set(rawIdx, displayIdx);
+      }
     });
   } else if (chunks.length > 0) {
-    // If no explicit supports were provided but chunks exist, take top safeMaxSources
-    const count = Math.min(chunks.length, safeMaxSources);
-    for (let i = 0; i < count; i++) {
-      selectedChunkIndices.push(i);
-      remapTable.set(i, i + 1);
+    // If no explicit supports were provided, deduplicate non-empty URIs while preserving top safeMaxSources
+    const seenUris = new Map();
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const uri = chunk?.web?.uri?.trim() || "";
+      const rawTitle = chunk?.web?.title?.trim() || "";
+
+      if (uri && seenUris.has(uri)) {
+        const existing = seenUris.get(uri);
+        existing.rawIndices.push(i);
+        if (!existing.title && rawTitle) {
+          existing.title = rawTitle;
+          existing.repChunkIdx = i;
+        }
+        continue;
+      }
+
+      if (selectedGroups.length >= safeMaxSources) continue;
+
+      const group = {
+        repChunkIdx: i,
+        firstChunkIdx: i,
+        rawIndices: [i],
+        citeCount: 0,
+        title: rawTitle,
+        uri,
+      };
+      if (uri) {
+        seenUris.set(uri, group);
+      }
+      selectedGroups.push(group);
     }
+
+    selectedGroups.forEach((group, i) => {
+      const displayIdx = i + 1;
+      for (const rawIdx of group.rawIndices) {
+        remapTable.set(rawIdx, displayIdx);
+      }
+    });
   }
 
   // Insert markers into text based on remapped display indices
@@ -1272,15 +1610,20 @@ export function formatOutput(rawText, metadata, maxSources = 8) {
     }
   }
 
-  const parts = [text.trim() || "No search results or information found."];
+  const trimmedBody = text.trim();
+  const fallbackBody =
+    selectedGroups.length > 0
+      ? "Grounded sources found (see Sources below)."
+      : "No search results or information found.";
+  const parts = [trimmedBody || fallbackBody];
   const structuredSources = [];
 
-  if (selectedChunkIndices.length > 0) {
-    const sourceLines = selectedChunkIndices.map((chunkIdx) => {
-      const chunk = chunks[chunkIdx];
-      const displayIdx = remapTable.get(chunkIdx);
-      const rawTitle = chunk?.web?.title?.trim() || "";
-      const uri = chunk?.web?.uri?.trim() || "";
+  if (selectedGroups.length > 0) {
+    const sourceLines = selectedGroups.map((group, idx) => {
+      const chunk = chunks[group.repChunkIdx];
+      const displayIdx = idx + 1;
+      const rawTitle = group.title || chunk?.web?.title?.trim() || "";
+      const uri = group.uri || chunk?.web?.uri?.trim() || "";
       const fallbackTitle = extractDomain(uri) || `Source ${displayIdx}`;
       const title = rawTitle || fallbackTitle;
       const safeTitle = escapeMarkdown(title);
@@ -1312,7 +1655,258 @@ export function formatOutput(rawText, metadata, maxSources = 8) {
 }
 
 /**
- * Internal execution logic for Google Search grounding with fallback chain.
+ * Parses a JSON body or SSE error payload (`data: {"error": ...}`) when a request fails.
+ */
+function parseJsonOrSseErrorBody(text) {
+  if (typeof text !== "string" || !text.trim()) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return parsed.find((item) => item?.error) || parsed[0] || null;
+    }
+    return parsed;
+  } catch {
+    // Check if upstream returned an SSE-framed error payload
+  }
+
+  let firstParsed = null;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      const obj = JSON.parse(payload);
+      if (obj?.error) return obj;
+      if (!firstParsed) firstParsed = obj;
+    } catch {
+      // Ignore non-JSON SSE lines
+    }
+  }
+  return firstParsed;
+}
+
+/**
+ * Merges a single GenerateContentResponse frame into an accumulator state.
+ */
+function mergeGroundingFrame(frame, state) {
+  if (!frame || typeof frame !== "object") return;
+  state.frameCount++;
+
+  if (frame.error && !state.streamError) {
+    state.streamError = frame;
+  }
+
+  if (frame.promptFeedback?.blockReason) {
+    state.blockReason = frame.promptFeedback.blockReason;
+  }
+
+  const candidate = frame.candidates?.[0];
+  if (!candidate) return;
+
+  if (candidate.finishReason) {
+    state.finishReason = candidate.finishReason;
+  }
+
+  const candidateParts = candidate.content?.parts || [];
+  for (const part of candidateParts) {
+    if (part?.thought) continue;
+    if (typeof part?.text === "string") {
+      state.responseText += part.text;
+    }
+  }
+
+  const gm = candidate.groundingMetadata;
+  if (gm && typeof gm === "object") {
+    state.groundingMetadata ??= {};
+    if (Array.isArray(gm.groundingChunks) && gm.groundingChunks.length > 0) {
+      state.groundingMetadata.groundingChunks = gm.groundingChunks;
+    }
+    if (Array.isArray(gm.groundingSupports) && gm.groundingSupports.length > 0) {
+      state.groundingMetadata.groundingSupports = gm.groundingSupports;
+    }
+    if (Array.isArray(gm.webSearchQueries) && gm.webSearchQueries.length > 0) {
+      state.groundingMetadata.webSearchQueries = gm.webSearchQueries;
+    }
+  }
+}
+
+/**
+ * Parses SSE text blocks (`data: ...`) into the accumulator state.
+ */
+function parseSseTextIntoState(sseText, state) {
+  let eventDataLines = [];
+
+  const flushEvent = () => {
+    if (eventDataLines.length === 0) return;
+    const payload = eventDataLines.join("\n").trim();
+    eventDataLines = [];
+    if (!payload || payload === "[DONE]") return;
+    try {
+      const parsed = JSON.parse(payload);
+      mergeGroundingFrame(parsed, state);
+    } catch {
+      // Ignore malformed SSE fragment
+    }
+  };
+
+  for (const rawLine of sseText.split("\n")) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (line === "") {
+      flushEvent();
+    } else if (line.startsWith("data:")) {
+      eventDataLines.push(line.slice(5).trimStart());
+    }
+  }
+  flushEvent();
+}
+
+/**
+ * Consumes either an SSE stream (`text/event-stream`) or a JSON response (`application/json` / array / mock),
+ * returning aggregated text, groundingMetadata, finishReason, blockReason, and any mid-stream error.
+ */
+async function consumeGroundingResponse(response, currentModel, progress) {
+  const state = {
+    frameCount: 0,
+    responseText: "",
+    finishReason: undefined,
+    blockReason: undefined,
+    groundingMetadata: undefined,
+    streamError: null,
+  };
+
+  const contentType = (response.headers?.get?.("content-type") || "").toLowerCase();
+  const isEventStream = contentType.includes("text/event-stream");
+
+  if (isEventStream && response.body && typeof response.body.getReader === "function") {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let lineBuffer = "";
+    let eventDataLines = [];
+    let rawPreview = "";
+    let announcedAnswerStream = false;
+
+    const flushEvent = () => {
+      if (eventDataLines.length === 0) return;
+      const payload = eventDataLines.join("\n").trim();
+      eventDataLines = [];
+      if (!payload || payload === "[DONE]") return;
+      try {
+        const parsed = JSON.parse(payload);
+        mergeGroundingFrame(parsed, state);
+      } catch {
+        // Ignore non-JSON keepalive payload
+      }
+    };
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const decoded = decoder.decode(value, { stream: true });
+        if (rawPreview.length < 600) {
+          rawPreview += decoded.slice(0, 600 - rawPreview.length);
+        }
+        lineBuffer += decoded;
+
+        let nlIdx;
+        while ((nlIdx = lineBuffer.indexOf("\n")) !== -1) {
+          const rawLine = lineBuffer.slice(0, nlIdx);
+          lineBuffer = lineBuffer.slice(nlIdx + 1);
+          const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+
+          if (line === "") {
+            flushEvent();
+          } else if (line.startsWith("data:")) {
+            eventDataLines.push(line.slice(5).trimStart());
+          }
+        }
+
+        if (!announcedAnswerStream && state.responseText.length > 0) {
+          announcedAnswerStream = true;
+          await reportProgress(progress, `Receiving grounded answer from ${currentModel}...`);
+        }
+      }
+
+      lineBuffer += decoder.decode();
+      if (lineBuffer) {
+        const trailingLine = lineBuffer.endsWith("\r") ? lineBuffer.slice(0, -1) : lineBuffer;
+        if (trailingLine.startsWith("data:")) {
+          eventDataLines.push(trailingLine.slice(5).trimStart());
+        }
+      }
+      flushEvent();
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        // Ignore release errors
+      }
+    }
+
+    if (state.frameCount === 0) {
+      // Fallback if proxy labeled normal JSON with text/event-stream
+      const trimmedPreview = rawPreview.trim();
+      if (trimmedPreview.startsWith("{") || trimmedPreview.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(trimmedPreview);
+          if (Array.isArray(parsed)) {
+            for (const item of parsed) mergeGroundingFrame(item, state);
+          } else {
+            mergeGroundingFrame(parsed, state);
+          }
+        } catch {
+          // Handled below
+        }
+      }
+      if (state.frameCount === 0) {
+        const safeText = sanitizeErrorText(rawPreview, 500);
+        throw new Error(`Failed to parse SSE response from ${currentModel} (${response.status}): ${safeText}`);
+      }
+    }
+
+    return state;
+  }
+
+  // Non-streaming JSON response (or mock fetch / proxy returning buffered SSE or JSON array)
+  const text = await response.text();
+  const trimmed = text.trimStart();
+
+  if (trimmed.startsWith("data:")) {
+    parseSseTextIntoState(text, state);
+    if (state.frameCount === 0) {
+      const safeText = sanitizeErrorText(text, 500);
+      throw new Error(`Failed to parse response from ${currentModel} (${response.status}): ${safeText}`);
+    }
+    return state;
+  }
+
+  let body = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = null;
+  }
+
+  if (body === null) {
+    const safeText = sanitizeErrorText(text, 500);
+    throw new Error(`Failed to parse response from ${currentModel} (${response.status}): ${safeText}`);
+  }
+
+  if (Array.isArray(body)) {
+    for (const item of body) {
+      mergeGroundingFrame(item, state);
+    }
+  } else {
+    mergeGroundingFrame(body, state);
+  }
+
+  return state;
+}
+
+/**
+ * Internal execution logic for Google Search grounding with tiered timeouts, fast-fallback budget
+ * reservation, SSE streaming aggregation, thinkingLevel capability clamping, and aggregated error diagnostics.
  */
 async function executeGroundingWithFallback({
   query,
@@ -1339,8 +1933,23 @@ async function executeGroundingWithFallback({
 
   const uniqueCandidates = Array.from(new Set(rawCandidates.map(normalizeModelId).filter(Boolean)));
 
+  const startTime = Date.now();
+  let timedOutOverall = false;
+  const attemptErrors = [];
+
+  const buildOverallTimeoutError = () => {
+    const timeoutSec = Number((config.timeoutMs / 1000).toFixed(1));
+    const baseMsg = `Google grounding exceeded overall timeout of ${timeoutSec}s`;
+    if (attemptErrors.length === 0) {
+      return new Error(baseMsg);
+    }
+    const trail = attemptErrors.map((e) => `${e.model} [${e.reason}]`).join(" -> ");
+    return new Error(`${baseMsg} (attempts: ${trail})`);
+  };
+
   const totalController = new AbortController();
   const totalTimer = setTimeout(() => {
+    timedOutOverall = true;
     totalController.abort(new Error(`Google grounding exceeded overall timeout of ${config.timeoutMs / 1000}s`));
   }, config.timeoutMs);
 
@@ -1361,31 +1970,64 @@ async function executeGroundingWithFallback({
     for (let i = 0; i < uniqueCandidates.length; i++) {
       const currentModel = uniqueCandidates[i];
 
-      if (totalController.signal.aborted) {
-        throw totalController.signal.reason || new Error("Google grounding request was cancelled or timed out.");
+      if (signal?.aborted) {
+        throw signal.reason || new Error("Operation cancelled by user");
+      }
+
+      const remainingBeforeProgress = config.timeoutMs - (Date.now() - startTime);
+      if (totalController.signal.aborted || remainingBeforeProgress <= 0) {
+        throw timedOutOverall || remainingBeforeProgress <= 0
+          ? buildOverallTimeoutError()
+          : totalController.signal.reason || new Error("Google grounding request was cancelled or timed out.");
       }
 
       await reportProgress(progress, `Searching Google with ${currentModel}...`);
 
-      if (totalController.signal.aborted) {
-        throw totalController.signal.reason || new Error("Google grounding request was cancelled or timed out.");
+      if (signal?.aborted) {
+        throw signal.reason || new Error("Operation cancelled by user");
       }
 
+      const remainingTotalMs = config.timeoutMs - (Date.now() - startTime);
+      if (totalController.signal.aborted || remainingTotalMs <= 0) {
+        throw timedOutOverall || remainingTotalMs <= 0
+          ? buildOverallTimeoutError()
+          : totalController.signal.reason || new Error("Google grounding request was cancelled or timed out.");
+      }
+
+      const attemptTimeoutMs = computeAttemptTimeoutMs({
+        currentModel,
+        candidateIndex: i,
+        uniqueCandidates,
+        config,
+        remainingTotalMs,
+      });
+
       const requestController = new AbortController();
+      const timeoutSec = Number((attemptTimeoutMs / 1000).toFixed(1));
       const requestTimer = setTimeout(() => {
         requestController.abort(
-          new Error(`Google grounding request to model '${currentModel}' timed out after ${config.requestTimeoutMs / 1000}s`)
+          new Error(`Google grounding request to model '${currentModel}' timed out after ${timeoutSec}s`)
         );
-      }, config.requestTimeoutMs);
+      }, attemptTimeoutMs);
 
       const onTotalAbortForRequest = () => {
         requestController.abort(totalController.signal.reason);
       };
       totalController.signal.addEventListener("abort", onTotalAbortForRequest, { once: true });
 
-      const querySuffix = config.keyInQuery ? `?key=${encodeURIComponent(config.apiKey)}` : "";
-      const url = `${config.baseURL}/models/${currentModel}:generateContent${querySuffix}`;
+      const useStreaming = config.streaming !== false;
+      const endpointAction = useStreaming ? "streamGenerateContent" : "generateContent";
+      let querySuffix = "";
+      if (useStreaming) {
+        querySuffix = config.keyInQuery ? `?alt=sse&key=${encodeURIComponent(config.apiKey)}` : "?alt=sse";
+      } else if (config.keyInQuery) {
+        querySuffix = `?key=${encodeURIComponent(config.apiKey)}`;
+      }
+      const url = `${config.baseURL}/models/${currentModel}:${endpointAction}${querySuffix}`;
       const headers = buildRequestHeaders(config);
+      if (useStreaming && !headers["Accept"] && !headers["accept"]) {
+        headers["Accept"] = "text/event-stream, application/json";
+      }
 
       const requestBody = {
         contents: [
@@ -1397,10 +2039,11 @@ async function executeGroundingWithFallback({
         tools: [{ googleSearch: {} }],
       };
 
-      if (config.thinkingLevel && /^gemini-[34]/i.test(currentModel)) {
+      const effectiveThinkingLevel = resolveModelThinkingLevel(config.thinkingLevel, currentModel);
+      if (effectiveThinkingLevel) {
         requestBody.generationConfig = {
           thinkingConfig: {
-            thinkingLevel: config.thinkingLevel,
+            thinkingLevel: effectiveThinkingLevel,
           },
         };
       }
@@ -1413,55 +2056,54 @@ async function executeGroundingWithFallback({
           signal: requestController.signal,
         });
 
-        const text = await response.text();
-        let body = null;
-        try {
-          body = JSON.parse(text);
-        } catch {
-          body = null;
-        }
+        if (!response.ok) {
+          const text = await response.text();
+          const body = parseJsonOrSseErrorBody(text);
+          const statusCode = response.status || body?.error?.code;
 
-        const statusCode = response.status || body?.error?.code;
+          // Halt immediately on global authentication / invalid API key errors (even non-JSON or SSE 401/403)
+          if (isFatalClientError(statusCode, body, text)) {
+            const rawMsg = body?.error?.message || text || response.statusText || "Authentication error";
+            const msg = sanitizeErrorText(String(rawMsg), 500);
+            throw new FatalError(
+              `Google grounding authentication/client error (${statusCode}) on model '${currentModel}': ${msg}`,
+              statusCode
+            );
+          }
 
-        // Halt immediately on global authentication / invalid API key errors (even non-JSON 401/403)
-        if (isFatalClientError(statusCode, body, text)) {
-          const rawMsg = body?.error?.message || text || response.statusText || "Authentication error";
-          const msg = sanitizeErrorText(String(rawMsg), 500);
-          throw new FatalError(
-            `Google grounding authentication/client error (${statusCode}) on model '${currentModel}': ${msg}`,
-            statusCode
-          );
-        }
-
-        if (body === null) {
-          const safeText = sanitizeErrorText(text, 500);
-          throw new Error(`Failed to parse response from ${currentModel} (${response.status}): ${safeText}`);
-        }
-
-        if (!response.ok || body?.error) {
           const rawMsg = body?.error?.message || text || response.statusText || "Request failed";
           const msg = sanitizeErrorText(String(rawMsg), 500);
           throw new Error(`Google grounding request to ${currentModel} failed (${response.status}): ${msg}`);
         }
 
-        if (body?.promptFeedback?.blockReason) {
-          throw new Error(
-            `Prompt blocked on model '${currentModel}': blockReason=${body.promptFeedback.blockReason}`
-          );
-        }
+        const parsedState = await consumeGroundingResponse(response, currentModel, progress);
 
-        const candidate = body.candidates?.[0];
-        const finishReason = candidate?.finishReason;
-        const candidateParts = candidate?.content?.parts || [];
-        let responseText = "";
-        for (const part of candidateParts) {
-          if (part?.thought) continue;
-          if (typeof part?.text === "string") {
-            responseText += part.text;
+        if (parsedState.streamError) {
+          const errBody = parsedState.streamError;
+          const errStatus = errBody?.error?.code || response.status || 500;
+          const rawErrText = JSON.stringify(errBody);
+          if (isFatalClientError(errStatus, errBody, rawErrText)) {
+            const msg = sanitizeErrorText(String(errBody?.error?.message || rawErrText), 500);
+            throw new FatalError(
+              `Google grounding authentication/client error (${errStatus}) on model '${currentModel}': ${msg}`,
+              errStatus
+            );
           }
+          const msg = sanitizeErrorText(String(errBody?.error?.message || "Stream error"), 500);
+          throw new Error(`Google grounding request to ${currentModel} failed (${errStatus}): ${msg}`);
         }
 
-        const groundingChunks = candidate?.groundingMetadata?.groundingChunks || [];
+        if (parsedState.blockReason) {
+          throw new Error(`Prompt blocked on model '${currentModel}': blockReason=${parsedState.blockReason}`);
+        }
+
+        const finishReason = parsedState.finishReason;
+        if (finishReason && BLOCKED_FINISH_REASONS.has(finishReason)) {
+          throw new Error(`Model '${currentModel}' output was blocked (finishReason=${finishReason})`);
+        }
+
+        const responseText = parsedState.responseText;
+        const groundingChunks = parsedState.groundingMetadata?.groundingChunks || [];
         const hasGroundingChunks = Array.isArray(groundingChunks) && groundingChunks.length > 0;
         const hasBodyText = responseText.trim().length > 0;
 
@@ -1473,7 +2115,7 @@ async function executeGroundingWithFallback({
 
         await reportProgress(progress, "Rendering citations and sources...");
 
-        const formatted = formatOutput(responseText, candidate?.groundingMetadata, maxSources);
+        const formatted = formatOutput(responseText, parsedState.groundingMetadata, maxSources);
         const result = {
           content: formatted.content,
           sources: formatted.sources,
@@ -1490,6 +2132,10 @@ async function executeGroundingWithFallback({
               model: result.model,
               timestamp: Date.now(),
             });
+            cacheWriteCounter++;
+            if (cacheWriteCounter % CACHE_SWEEP_WRITE_INTERVAL === 0 && typeof storage.scan === "function") {
+              void pruneStorageCache(storage, config.cacheTtlMs).catch(() => {});
+            }
           } catch {
             // Storage write errors should not break search
           }
@@ -1497,20 +2143,29 @@ async function executeGroundingWithFallback({
 
         return result;
       } catch (err) {
-        if (err instanceof Error && err.message && config.keyInQuery && err.message.includes("key=")) {
+        if (err instanceof Error && err.message && (config.keyInQuery || err.message.includes("key="))) {
           err.message = sanitizeErrorText(err.message, 500);
         }
         lastError = err;
 
-        // Propagate fatal auth errors and external/overall cancellations immediately
+        // Propagate fatal auth errors and external user cancellations immediately
         if (err instanceof FatalError) {
           throw err;
         }
-        if (totalController.signal.aborted) {
-          throw totalController.signal.reason || err;
+        if (signal?.aborted) {
+          throw signal.reason || err;
         }
 
-        // For retryable or model-specific errors (429, 400 unsupported model, 404, 5xx, empty output) or timeouts, fall back
+        attemptErrors.push({
+          model: currentModel,
+          reason: sanitizeErrorText(err?.message || String(err), 220),
+        });
+
+        if (totalController.signal.aborted) {
+          throw timedOutOverall ? buildOverallTimeoutError() : totalController.signal.reason || err;
+        }
+
+        // For retryable or model-specific errors (429, 400 unsupported model, 404, 5xx, empty/blocked output) or timeouts, fall back
         const nextModel = uniqueCandidates[i + 1];
         if (nextModel) {
           await reportProgress(
@@ -1522,6 +2177,11 @@ async function executeGroundingWithFallback({
         clearTimeout(requestTimer);
         totalController.signal.removeEventListener("abort", onTotalAbortForRequest);
       }
+    }
+
+    if (attemptErrors.length > 1) {
+      const summary = attemptErrors.map((e) => `${e.model} [${e.reason}]`).join(" -> ");
+      throw new Error(`All candidate models failed for Google grounding: ${summary}`);
     }
 
     throw lastError || new Error("All candidate models failed for Google grounding.");
@@ -1599,7 +2259,14 @@ export async function runGoogleGrounding(args, runContext = {}) {
 
   const requestedModel = normalizeModelId(args.model);
   const effectivePrimaryModel = requestedModel || config.model;
-  const dedupeKey = makeCacheKey(query, args.context, effectivePrimaryModel, maxSources, config.baseURL);
+  const dedupeKey = makeCacheKey(
+    query,
+    args.context,
+    effectivePrimaryModel,
+    maxSources,
+    config.baseURL,
+    config.thinkingLevel
+  );
 
   // --- Cache lookup via ctx.storage ---
   const cacheEnabled = config.cacheTtlMs > 0 && Boolean(storage && typeof storage.get === "function");
@@ -1764,6 +2431,15 @@ export default {
       directory: ctx?.location?.directory,
     };
 
+    // Opportunistically sweep expired cache entries from durable storage in the background on startup
+    if (ctx?.storage && typeof ctx.storage.scan === "function") {
+      const startupCacheTtlMs = resolveNonNegativeNumber(
+        pluginOptions.cacheTtlMs !== undefined ? pluginOptions.cacheTtlMs : process.env.OPENCODE_GOOGLE_CACHE_TTL_MS,
+        DEFAULT_CACHE_TTL_MS
+      );
+      void pruneStorageCache(ctx.storage, startupCacheTtlMs).catch(() => {});
+    }
+
     // 1. Integration domain registration (OpenChamber Settings -> Web Search -> Google Gemini Grounding)
     if (ctx?.integration?.transform) {
       await ctx.integration.transform((editor) => {
@@ -1796,7 +2472,7 @@ export default {
                 type: "string",
                 title: "Preferred Model (Optional)",
                 description:
-                  "Default Gemini model for Google Search grounding (e.g. gemini-4-hydrogen, gemini-3.8-flash).",
+                  "Default Gemini model for Google Search grounding (e.g. gemini-4-hydrogen, gemini-4-neon, gemini-3.8-flash).",
                 placeholder: DEFAULT_MODEL,
                 required: false,
               },
@@ -1851,7 +2527,7 @@ export default {
               model: {
                 type: "string",
                 description:
-                  "Optional Gemini model ID for grounding (e.g. 'gemini-4-hydrogen', 'gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.7-flash'). Defaults to configured model with automatic fallback.",
+                  "Optional Gemini model ID for grounding (e.g. 'gemini-4-hydrogen', 'gemini-4-neon', 'gemini-3.8-flash', 'gemini-3.5-flash-lite'). Defaults to configured model with automatic fallback.",
               },
               max_sources: {
                 type: "number",
@@ -1878,6 +2554,7 @@ export default {
               metadata: {
                 model: result.model,
                 cached: Boolean(result.cached),
+                sourcesCount: Array.isArray(result.sources) ? result.sources.length : 0,
               },
             };
           },

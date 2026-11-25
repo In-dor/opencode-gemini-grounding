@@ -12,6 +12,10 @@ import {
   isOfficialGoogleEndpoint,
   buildRequestHeaders,
   makeCacheKey,
+  isFastFallbackModel,
+  resolveModelThinkingLevel,
+  computeAttemptTimeoutMs,
+  pruneStorageCache,
   extractSnippetForSource,
   stripJsonComments,
   readCredentialFromSqlite,
@@ -52,6 +56,7 @@ function withIsolatedEnv(fn) {
       "OPENCODE_GOOGLE_TIMEOUT_MS",
       "OPENCODE_GOOGLE_REQUEST_TIMEOUT_MS",
       "OPENCODE_GOOGLE_CACHE_TTL_MS",
+      "OPENCODE_GOOGLE_STREAMING",
     ];
     const saved = new Map();
     for (const key of envKeys) {
@@ -373,19 +378,19 @@ test("plugin setup registers only google_grounding by default and websearch_cite
 });
 
 test(
-  "resolveConfig v1.5.0 defaults, OPENCODE_GOOGLE_FALLBACK_MODELS, GOOGLE_GENERATIVE_AI_API_KEY, and project configs",
+  "resolveConfig v1.6.0 defaults, OPENCODE_GOOGLE_FALLBACK_MODELS, GOOGLE_GENERATIVE_AI_API_KEY, and project configs",
   withIsolatedEnv(async (_t, { tmpRoot }) => {
     const defaults = resolveConfig({}, { directory: tmpRoot });
     assert.equal(defaults.model, "gemini-4-hydrogen");
-    assert.equal(defaults.requestTimeoutMs, 60000);
-    assert.equal(defaults.timeoutMs, 180000);
+    assert.equal(defaults.requestTimeoutMs, 180000);
+    assert.equal(defaults.timeoutMs, 360000);
+    assert.equal(defaults.streaming, true);
     assert.equal(defaults.thinkingLevel, undefined);
     assert.deepEqual(defaults.fallbackModels, [
       "gemini-4-hydrogen",
+      "gemini-4-neon",
       "gemini-3.8-flash",
       "gemini-3.5-flash-lite",
-      "gemini-3.7-flash",
-      "gemini-3.1-flash-lite",
       "gemini-3-flash-preview",
       "gemini-2.5-flash",
     ]);
@@ -1115,10 +1120,505 @@ test(
       );
 
       assert.equal(res.model, "gemini-3.8-flash");
-      assert.ok(seenUrl.startsWith("https://runtime-gateway.example.com/v1beta/models/gemini-3.8-flash:generateContent"));
+      assert.equal(
+        seenUrl,
+        "https://runtime-gateway.example.com/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse"
+      );
+      assert.equal(seenHeaders["Accept"], "text/event-stream, application/json");
       assert.equal(seenHeaders["X-From-Provider"], "v2");
       assert.equal(seenHeaders["x-goog-api-key"], "file-secret-key");
       assert.equal(seenHeaders["Authorization"], "Bearer file-secret-key");
+
+      // Also verify streaming: false uses :generateContent
+      await runGoogleGrounding(
+        { query: "provider runtime non-streaming" },
+        {
+          directory: projDir,
+          options: { cacheTtlMs: 0, streaming: false, baseURL: "https://runtime-gateway.example.com" },
+        }
+      );
+      assert.equal(seenUrl, "https://runtime-gateway.example.com/v1beta/models/gemini-4-hydrogen:generateContent");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  })
+);
+
+test(
+  "computeAttemptTimeoutMs and runGoogleGrounding reserve fast-fallback budget so hanging flagships never starve Flash models",
+  withIsolatedEnv(async () => {
+    const chain = [
+      "gemini-4-hydrogen",
+      "gemini-4-neon",
+      "gemini-3.8-flash",
+      "gemini-3.5-flash-lite",
+      "gemini-3-flash-preview",
+      "gemini-2.5-flash",
+    ];
+    const cfg = { requestTimeoutMs: 180000, timeoutMs: 360000 };
+
+    assert.equal(isFastFallbackModel("gemini-4-hydrogen"), false);
+    assert.equal(isFastFallbackModel("gemini-4-neon"), false);
+    assert.equal(isFastFallbackModel("gemini-3.8-flash"), true);
+    assert.equal(isFastFallbackModel("gemini-3.5-flash-lite"), true);
+
+    // 1. Hydrogen at t=0: gets full 180s (360s - 45s = 315s >= 180s)
+    const t0 = computeAttemptTimeoutMs({
+      currentModel: chain[0],
+      candidateIndex: 0,
+      uniqueCandidates: chain,
+      config: cfg,
+      remainingTotalMs: 360000,
+    });
+    assert.equal(t0, 180000);
+
+    // 2. If Hydrogen timed out at 180s, Neon has 180s total left, minus 45s reserve = 135s
+    const t1AfterHang = computeAttemptTimeoutMs({
+      currentModel: chain[1],
+      candidateIndex: 1,
+      uniqueCandidates: chain,
+      config: cfg,
+      remainingTotalMs: 180000,
+    });
+    assert.equal(t1AfterHang, 135000);
+
+    // 2b. If Hydrogen failed fast (e.g. 429 in 0.5s), Neon gets full 180s!
+    const t1AfterFast429 = computeAttemptTimeoutMs({
+      currentModel: chain[1],
+      candidateIndex: 1,
+      uniqueCandidates: chain,
+      config: cfg,
+      remainingTotalMs: 359500,
+    });
+    assert.equal(t1AfterFast429, 180000);
+
+    // 3. Fallback Flash model is capped at 60s even when plenty of total time remains
+    const t2Normal = computeAttemptTimeoutMs({
+      currentModel: chain[2],
+      candidateIndex: 2,
+      uniqueCandidates: chain,
+      config: cfg,
+      remainingTotalMs: 350000,
+    });
+    assert.equal(t2Normal, 60000);
+
+    // 4. End-to-end runtime proof: both Hydrogen & Neon hang forever, yet 3.8-flash still gets budget and rescues!
+    const originalFetch = globalThis.fetch;
+    const attemptedModels = [];
+    globalThis.fetch = async (url, init) => {
+      const m = String(url).match(/\/models\/([^:?]+):/)?.[1] || "";
+      attemptedModels.push(m);
+      if (m === "gemini-4-hydrogen" || m === "gemini-4-neon") {
+        return await new Promise((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => {
+            reject(init.signal.reason || new Error("Timed out"));
+          });
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          candidates: [{ finishReason: "STOP", content: { parts: [{ text: "Rescued by fast Flash!" }] } }],
+        }),
+        { status: 200 }
+      );
+    };
+
+    try {
+      const rescued = await runGoogleGrounding(
+        { query: "budget starvation test" },
+        {
+          options: {
+            apiKey: "k",
+            model: "gemini-4-hydrogen",
+            fallbackModels: ["gemini-4-neon", "gemini-3.8-flash", "gemini-3.5-flash-lite"],
+            requestTimeoutMs: 140,
+            timeoutMs: 260,
+            cacheTtlMs: 0,
+          },
+        }
+      );
+      assert.equal(rescued.model, "gemini-3.8-flash");
+      assert.ok(rescued.content.includes("Rescued by fast Flash!"));
+      assert.deepEqual(attemptedModels, ["gemini-4-hydrogen", "gemini-4-neon", "gemini-3.8-flash"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  })
+);
+
+test(
+  "resolveModelThinkingLevel clamps XHIGH/MINIMAL safely across fallback chain and makeCacheKey isolates thinkingLevel",
+  withIsolatedEnv(async () => {
+    assert.equal(resolveModelThinkingLevel("XHIGH", "gemini-4-hydrogen"), "XHIGH");
+    assert.equal(resolveModelThinkingLevel("XHIGH", "gemini-4-neon"), "XHIGH");
+    assert.equal(resolveModelThinkingLevel("XHIGH", "gemini-4-carbon"), "XHIGH");
+    assert.equal(resolveModelThinkingLevel("XHIGH", "gemini-4-argon"), "HIGH");
+    assert.equal(resolveModelThinkingLevel("XHIGH", "gemini-3.8-flash"), "HIGH");
+    assert.equal(resolveModelThinkingLevel("XHIGH", "gemini-3.5-flash-lite"), "HIGH");
+    assert.equal(resolveModelThinkingLevel("XHIGH", "gemini-2.5-flash"), undefined);
+
+    assert.equal(resolveModelThinkingLevel("minimal", "gemini-3.5-flash-lite"), "MINIMAL");
+    assert.equal(resolveModelThinkingLevel("minimal", "gemini-3.8-flash"), "MINIMAL");
+    assert.equal(resolveModelThinkingLevel("minimal", "gemini-4-hydrogen"), "LOW");
+
+    // makeCacheKey backward compatibility when thinkingLevel is empty, and differentiation when set
+    const kDefault = makeCacheKey("q", "c", "gemini-4-hydrogen", 8, "");
+    const kEmptyThinking = makeCacheKey("q", "c", "gemini-4-hydrogen", 8, "", "");
+    const kLow = makeCacheKey("q", "c", "gemini-4-hydrogen", 8, "", "LOW");
+    const kXhigh = makeCacheKey("q", "c", "gemini-4-hydrogen", 8, "", "xhigh");
+    assert.equal(kDefault, kEmptyThinking);
+    assert.notEqual(kDefault, kLow);
+    assert.notEqual(kLow, kXhigh);
+
+    // Runtime fallback with thinkingLevel: "XHIGH" clamps to "HIGH" on gemini-3.8-flash and omits on gemini-2.5-flash
+    const originalFetch = globalThis.fetch;
+    const seenThinking = [];
+    globalThis.fetch = async (url, init) => {
+      const m = String(url).match(/\/models\/([^:?]+):/)?.[1] || "";
+      const parsedBody = JSON.parse(init.body);
+      seenThinking.push({ model: m, thinking: parsedBody.generationConfig?.thinkingConfig?.thinkingLevel });
+      if (m !== "gemini-2.5-flash") {
+        return new Response(JSON.stringify({ error: { code: 503, message: "Overloaded" } }), { status: 503 });
+      }
+      return new Response(
+        JSON.stringify({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: "2.5 ok" }] } }] }),
+        { status: 200 }
+      );
+    };
+
+    try {
+      const res = await runGoogleGrounding(
+        { query: "xhigh clamp test" },
+        {
+          options: {
+            apiKey: "k",
+            model: "gemini-4-hydrogen",
+            fallbackModels: ["gemini-3.8-flash", "gemini-2.5-flash"],
+            thinkingLevel: "xhigh",
+            cacheTtlMs: 0,
+          },
+        }
+      );
+      assert.equal(res.model, "gemini-2.5-flash");
+      assert.deepEqual(seenThinking, [
+        { model: "gemini-4-hydrogen", thinking: "XHIGH" },
+        { model: "gemini-3.8-flash", thinking: "HIGH" },
+        { model: "gemini-2.5-flash", thinking: undefined },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  })
+);
+
+test(
+  "aggregated error diagnostics preserve primary failure reasons instead of masking behind last model 503",
+  withIsolatedEnv(async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const m = String(url).match(/\/models\/([^:?]+):/)?.[1] || "";
+      if (m === "gemini-4-hydrogen") {
+        return new Response(JSON.stringify({ error: { code: 429, message: "Quota exhausted on hydrogen" } }), {
+          status: 429,
+        });
+      }
+      if (m === "gemini-4-neon") {
+        return new Response(JSON.stringify({ error: { code: 504, message: "Upstream gateway timeout on neon" } }), {
+          status: 504,
+        });
+      }
+      return new Response(JSON.stringify({ error: { code: 503, message: "No available channel for 2.5-flash" } }), {
+        status: 503,
+      });
+    };
+
+    try {
+      await assert.rejects(
+        () =>
+          runGoogleGrounding(
+            { query: "all fail diagnostic test" },
+            {
+              options: {
+                apiKey: "k",
+                model: "gemini-4-hydrogen",
+                fallbackModels: ["gemini-4-neon", "gemini-2.5-flash"],
+                cacheTtlMs: 0,
+              },
+            }
+          ),
+        (err) => {
+          assert.match(err.message, /All candidate models failed for Google grounding:/);
+          assert.match(err.message, /gemini-4-hydrogen.*Quota exhausted on hydrogen/);
+          assert.match(err.message, /gemini-4-neon.*Upstream gateway timeout on neon/);
+          assert.match(err.message, /gemini-2\.5-flash.*No available channel for 2\.5-flash/);
+          return true;
+        }
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  })
+);
+
+test(
+  "SSE stream aggregation handles multi-byte UTF-8 chunks, keepalives, [DONE], groundingMetadata, and SSE 401 FatalError",
+  withIsolatedEnv(async () => {
+    const originalFetch = globalThis.fetch;
+    const progressEvents = [];
+
+    // Split multi-byte Chinese UTF-8 character '界' across two binary Uint8Array chunks
+    const frame1 = JSON.stringify({
+      candidates: [
+        {
+          content: {
+            parts: [
+              { text: "internal reasoning", thought: true },
+              { text: "你好世" },
+            ],
+          },
+        },
+      ],
+    });
+    const frame2 = JSON.stringify({
+      candidates: [
+        {
+          finishReason: "STOP",
+          content: { parts: [{ text: "界，这是流式测试。" }] },
+          groundingMetadata: {
+            groundingChunks: [{ web: { title: "Stream Doc", uri: "https://stream.example.com/doc" } }],
+            groundingSupports: [{ segment: { startIndex: 0, endIndex: 36 }, groundingChunkIndices: [0] }],
+            webSearchQueries: ["流式测试"],
+          },
+        },
+      ],
+    });
+
+    const fullSsePayload = [
+      ": keepalive ping\r\n\r\n",
+      `data: ${frame1}\r\n\r\n`,
+      `data: ${frame2}\r\n\r\n`,
+      // Trailing empty metadata frame must NOT overwrite populated groundingMetadata
+      `data: ${JSON.stringify({ candidates: [{ finishReason: "STOP", groundingMetadata: {} }] })}\r\n\r\n`,
+      "data: [DONE]\r\n\r\n",
+    ].join("");
+
+    const fullBytes = new TextEncoder().encode(fullSsePayload);
+
+    globalThis.fetch = async () => {
+      const stream = new ReadableStream({
+        start(controller) {
+          // Slice into small arbitrary byte chunks (including mid-UTF8 and mid-CRLF splits)
+          for (let offset = 0; offset < fullBytes.length; offset += 17) {
+            controller.enqueue(fullBytes.subarray(offset, offset + 17));
+          }
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream; charset=utf-8" },
+      });
+    };
+
+    try {
+      const res = await runGoogleGrounding(
+        { query: "sse test" },
+        {
+          progress: ({ status }) => progressEvents.push(status),
+          options: { apiKey: "k", model: "gemini-4-hydrogen", cacheTtlMs: 0 },
+        }
+      );
+
+      assert.ok(res.content.includes("你好世界，这是流式测试。[1]"));
+      assert.ok(!res.content.includes("internal reasoning"));
+      assert.equal(res.sources.length, 1);
+      assert.equal(res.sources[0].uri, "https://stream.example.com/doc");
+      assert.ok(progressEvents.some((s) => s.includes("Receiving grounded answer from gemini-4-hydrogen")));
+
+      // Verify SSE-formatted HTTP 400 invalid API key still triggers immediate FatalError
+      let sseAuthCalls = 0;
+      globalThis.fetch = async () => {
+        sseAuthCalls++;
+        return new Response(
+          `data: ${JSON.stringify({ error: { code: 400, message: "API key not valid. Please pass a valid API key." } })}\n\n`,
+          { status: 400, headers: { "Content-Type": "text/event-stream" } }
+        );
+      };
+
+      await assert.rejects(
+        () =>
+          runGoogleGrounding(
+            { query: "sse fatal auth" },
+            { options: { apiKey: "bad", model: "m1", fallbackModels: ["m2"], cacheTtlMs: 0 } }
+          ),
+        (err) => err instanceof FatalError
+      );
+      assert.equal(sseAuthCalls, 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  })
+);
+
+test(
+  "pruneStorageCache sweeps expired entries, paginates scan cursors, caps maxEntries, and runs on plugin.setup",
+  withIsolatedEnv(async () => {
+    const now = Date.now();
+    const backing = new Map([
+      ["cache:v2:grounding:expired1", { content: "old1", timestamp: now - 700000 }],
+      ["cache:v2:grounding:expired2", { content: "old2", timestamp: now - 900000 }],
+      ["cache:v2:grounding:corrupt", { content: "no-timestamp" }],
+      ["cache:v2:grounding:valid_oldest", { content: "v1", timestamp: now - 50000 }],
+      ["cache:v2:grounding:valid_mid", { content: "v2", timestamp: now - 30000 }],
+      ["cache:v2:grounding:valid_newest", { content: "v3", timestamp: now - 10000 }],
+      ["other:setting", { keep: true }],
+    ]);
+
+    const mockStorage = {
+      get: async (k) => backing.get(k),
+      set: async (k, v) => backing.set(k, v),
+      remove: async (k) => backing.delete(k),
+      scan: async ({ prefix, after }) => {
+        const all = Array.from(backing.entries())
+          .filter(([k]) => k.startsWith(prefix))
+          .sort(([a], [b]) => a.localeCompare(b));
+        const startIdx = after ? all.findIndex(([k]) => k > after) : 0;
+        if (startIdx === -1) return { entries: [] };
+        const slice = all.slice(startIdx, startIdx + 2);
+        const next = startIdx + 2 < all.length ? slice[slice.length - 1][0] : undefined;
+        return {
+          entries: slice.map(([key, value]) => ({ key, value })),
+          next,
+        };
+      },
+    };
+
+    // TTL = 600_000, maxEntries = 2 -> removes 3 expired/corrupt + 1 oldest valid = 4 removed
+    const removedCount = await pruneStorageCache(mockStorage, 600000, 2);
+    assert.equal(removedCount, 4);
+    assert.equal(backing.has("cache:v2:grounding:expired1"), false);
+    assert.equal(backing.has("cache:v2:grounding:expired2"), false);
+    assert.equal(backing.has("cache:v2:grounding:corrupt"), false);
+    assert.equal(backing.has("cache:v2:grounding:valid_oldest"), false);
+    assert.equal(backing.has("cache:v2:grounding:valid_mid"), true);
+    assert.equal(backing.has("cache:v2:grounding:valid_newest"), true);
+    assert.equal(backing.has("other:setting"), true);
+
+    // Also verify plugin.setup triggers background sweep
+    backing.set("cache:v2:grounding:stale_on_boot", { content: "stale", timestamp: now - 9999999 });
+    await plugin.setup({ options: { cacheTtlMs: 60000 }, storage: mockStorage });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(backing.has("cache:v2:grounding:stale_on_boot"), false);
+  })
+);
+
+test(
+  "formatOutput deduplicates identical URIs & ranks heavily cited sources, SAFETY finishReason falls back, and SQLite active=0 loses to NULL",
+  withIsolatedEnv(async (_t, { xdgData }) => {
+    // 1. Duplicate URI deduplication + frequency-based top maxSources selection
+    const rawText = "Fact A. Fact B. Fact C.";
+    const formatted = formatOutput(
+      rawText,
+      {
+        groundingChunks: [
+          { web: { title: "Passing Mention", uri: "https://once.example.com/1" } },
+          { web: { title: "", uri: "https://core.example.com/doc" } },
+          { web: { title: "Core Official Doc", uri: "https://core.example.com/doc" } }, // duplicate URI with better title
+          { web: { title: "Second Core", uri: "https://second.example.com/doc" } },
+        ],
+        groundingSupports: [
+          { segment: { startIndex: 0, endIndex: 7 }, groundingChunkIndices: [0, 1] },
+          { segment: { startIndex: 8, endIndex: 15 }, groundingChunkIndices: [2, 3] },
+          { segment: { startIndex: 16, endIndex: 23 }, groundingChunkIndices: [2, 3] },
+        ],
+      },
+      2 // Cap to 2 sources -> should pick core.example.com (cited 3x across chunks 1&2) and second.example.com (cited 2x)
+    );
+
+    assert.equal(formatted.sources.length, 2);
+    assert.equal(formatted.sources[0].uri, "https://core.example.com/doc");
+    assert.equal(formatted.sources[0].title, "Core Official Doc");
+    assert.equal(formatted.sources[1].uri, "https://second.example.com/doc");
+    // Both chunk 1 and chunk 2 remap to [1]!
+    assert.ok(formatted.content.includes("Fact A.[1] Fact B.[1][2] Fact C.[1][2]"));
+
+    // 2. Empty body text with valid chunks produces non-contradictory message
+    const sourcesOnly = formatOutput("", {
+      groundingChunks: [{ web: { title: "Ref", uri: "https://ref.example.com" } }],
+    });
+    assert.ok(sourcesOnly.content.startsWith("Grounded sources found (see Sources below)."));
+
+    // 3. escapeMarkdown escapes backslashes before brackets, and extractSnippetForSource handles **bold** / digits after period
+    assert.equal(escapeMarkdown("Path C:\\dir\\[test]"), "Path C:\\\\dir\\\\\\[test\\]");
+    const mdParagraph =
+      "Background intro sentence that is long enough to exceed sixty characters easily[1]. **2026** benchmark shows 2x speedup[2]. Extra tail sentence[3].";
+    assert.equal(extractSnippetForSource(2, mdParagraph), "**2026** benchmark shows 2x speedup[2].");
+
+    // 4. SQLite credential ordering: active=1 > active IS NULL > active=0
+    const dbDir = path.join(xdgData, "opencode");
+    fs.mkdirSync(dbDir, { recursive: true });
+    const dbPath = path.join(dbDir, "active-order.db");
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE credential (
+        id TEXT PRIMARY KEY,
+        integration_id TEXT,
+        label TEXT NOT NULL,
+        value TEXT NOT NULL,
+        active INTEGER,
+        time_created INTEGER NOT NULL,
+        time_updated INTEGER NOT NULL
+      );
+    `);
+    db.prepare("INSERT INTO credential VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+      "c_disabled",
+      "google",
+      "Disabled Newer",
+      JSON.stringify({ type: "key", key: "disabled-key-0" }),
+      0,
+      5000,
+      5000
+    );
+    db.prepare("INSERT INTO credential VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+      "c_migrated",
+      "google",
+      "Migrated Null",
+      JSON.stringify({ type: "key", key: "migrated-null-key" }),
+      null,
+      1000,
+      1000
+    );
+    db.close();
+
+    const picked = readCredentialFromSqlite("google", dbPath);
+    assert.equal(picked.apiKey, "migrated-null-key");
+
+    // 5. SAFETY finishReason triggers fallback even if partial text was returned
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("gemini-4-hydrogen")) {
+        return new Response(
+          JSON.stringify({
+            candidates: [{ finishReason: "SAFETY", content: { parts: [{ text: "I cannot answer..." }] } }],
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          candidates: [{ finishReason: "STOP", content: { parts: [{ text: "Clean fallback answer." }] } }],
+        }),
+        { status: 200 }
+      );
+    };
+
+    try {
+      const safetyRes = await runGoogleGrounding(
+        { query: "safety fallback test" },
+        { options: { apiKey: "k", model: "gemini-4-hydrogen", fallbackModels: ["gemini-3.8-flash"], cacheTtlMs: 0 } }
+      );
+      assert.equal(safetyRes.model, "gemini-3.8-flash");
+      assert.ok(safetyRes.content.includes("Clean fallback answer."));
     } finally {
       globalThis.fetch = originalFetch;
     }
